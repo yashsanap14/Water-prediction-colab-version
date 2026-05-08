@@ -1,0 +1,31 @@
+# Downloaded images and training data
+water_level_demo/
+/tmp/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Model outputs / results
+*.pth
+*.pkl
+*.onnx
+
+# IDE
+.vscode/
+.idea/

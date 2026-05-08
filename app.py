@@ -235,7 +235,6 @@ def start_training(
     learning_rate, val_ratio, test_ratio,
     freeze_ratio, seed,
     use_small_backbone, save_to_drive,
-    roi,   # tuple/list from gr.State – set in the ROI tab
 ):
     """Gradio click handler for 'Start Training' button. Streams log text."""
     mappings = _state.get("mappings")
@@ -250,8 +249,8 @@ def start_training(
     chosen_keys = rng.choice(len(keys), size=n, replace=False)
     sub_mappings = {keys[i]: mappings[keys[i]] for i in chosen_keys}
 
-    # roi comes from gr.State as a list/tuple
-    roi = tuple(int(v) for v in roi)
+    # Read ROI from the global _state dict (set by the ROI tab)
+    roi = _state.get("roi", (951, 0, 1136, 1920))
 
     # Choose backbone
     if use_small_backbone:
@@ -371,9 +370,10 @@ def launch_gradio(share: bool = True, debug: bool = False):
             """
         )
 
-    # ── gr.State: shares ROI across tabs without needing cross-tab component refs ──
-    # Default = Pinewood Road ROI (y1, x1, y2, x2)
-    roi_state = gr.State(value=(951, 0, 1136, 1920))
+    # ROI is stored in the _state Python dict by the ROI tab handlers.
+    # No gr.State or cross-tab Gradio component references needed.
+    # Default = Pinewood Road ROI.
+    _state.setdefault("roi", (951, 0, 1136, 1920))
 
     # ═══════════════════════════════════════════════════════════════════
     # SECTION 1 – Dataset Upload
@@ -440,29 +440,21 @@ def launch_gradio(share: bool = True, debug: bool = False):
             cropped_img = gr.Image(label="Cropped ROI",    type="pil")
         preview_status = gr.Textbox(label="Preview Status", interactive=False)
 
-        # When any ROI number changes, pack all four into roi_state (gr.State)
-        def _pack_roi(y1, x1, y2, x2):
-            return (int(y1), int(x1), int(y2), int(x2))
+        # Write ROI values to _state dict whenever a number changes
+        def _save_roi_to_state(y1, x1, y2, x2):
+            _state["roi"] = (int(y1), int(x1), int(y2), int(x2))
 
         for _src in [roi_y1, roi_x1, roi_y2, roi_x2]:
             _src.change(
-                fn=_pack_roi,
+                fn=_save_roi_to_state,
                 inputs=[roi_y1, roi_x1, roi_y2, roi_x2],
-                outputs=roi_state,
+                outputs=[],
             )
 
-        def _site_changed_with_state(site_name):
-            """Auto-fill ROI fields AND update roi_state together."""
-            defaults = td.DEFAULT_ROI.get(site_name)
-            if defaults:
-                y1, x1, y2, x2 = defaults
-                return y1, x1, y2, x2, f"ROI auto-filled for {site_name}", (y1, x1, y2, x2)
-            return 0, 0, 1080, 1920, "No default ROI for this site – set manually.", (0, 0, 1080, 1920)
-
         site_dd.change(
-            fn=_site_changed_with_state,
+            fn=site_changed,          # existing function – returns y1,x1,y2,x2,status
             inputs=site_dd,
-            outputs=[roi_y1, roi_x1, roi_y2, roi_x2, roi_status, roi_state],
+            outputs=[roi_y1, roi_x1, roi_y2, roi_x2, roi_status],
         )
         preview_btn.click(
             fn=preview_roi_handler,
@@ -526,7 +518,6 @@ def launch_gradio(share: bool = True, debug: bool = False):
         )
 
         # streaming=True is required for generator-based (yield) handlers
-        # roi_state is defined at Blocks scope – valid to reference from any tab
         train_btn.click(
             fn=start_training,
             inputs=[
@@ -534,7 +525,7 @@ def launch_gradio(share: bool = True, debug: bool = False):
                 t_lr, t_val_ratio, t_test_ratio,
                 t_freeze, t_seed,
                 t_small_model, t_save_drive,
-                roi_state,   # gr.State shared from ROI tab
+                # ROI is read from _state dict inside start_training
             ],
             outputs=train_log,
             streaming=True,

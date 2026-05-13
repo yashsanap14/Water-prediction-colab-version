@@ -440,7 +440,7 @@ def launch_gradio(share: bool = True, debug: bool = False):
             for src in [roi_y1, roi_x1, roi_y2, roi_x2]:
                 src.change(fn=_save_roi,
                            inputs=[roi_y1, roi_x1, roi_y2, roi_x2],
-                           outputs=[])
+                           outputs=None)  # must be None, not [] – Gradio 5 crashes on empty list
 
             # Auto-fill ROI when site changes in Tab 1
             site_dd.change(

@@ -44,7 +44,7 @@ for d in [BASE_DIR, DATA_DIR, IMAGES_DIR, RESULTS_DIR]:
 # ---------------------------------------------------------------------------
 _state = {
     "mappings":   None,   # {abs_image_path: float water_level}
-    "roi":        (951, 0, 1136, 1920),
+    "roi":        (951, 0, 1136, 1920),   # x1, y1, x2, y2 – vertical gauge strip
     "csv_path":   None,
 }
 
@@ -157,8 +157,13 @@ def get_acquisition_summary():
 # Tab 2 – ROI handlers
 # ---------------------------------------------------------------------------
 
-def preview_roi_handler(y1, x1, y2, x2):
-    roi = (int(y1), int(x1), int(y2), int(x2))
+# Pinewood vertical gauge strip – x1, y1, x2, y2 (XYXY format)
+PINEWOOD_ROI_XYXY = (951, 0, 1136, 1920)
+
+
+def preview_roi_handler(x1, y1, x2, y2):
+    # Store ROI in x1, y1, x2, y2 format
+    roi = (int(x1), int(y1), int(x2), int(y2))
     _state["roi"] = roi
 
     mappings = _state.get("mappings")
@@ -178,7 +183,8 @@ def preview_roi_handler(y1, x1, y2, x2):
         orig, cropped = td.preview_roi(img_path, roi)
         status = (
             f"Original: {orig.width}x{orig.height} px | "
-            f"Cropped: {cropped.width}x{cropped.height} px"
+            f"Cropped: {cropped.width}x{cropped.height} px | "
+            f"ROI: x1={roi[0]}, y1={roi[1]}, x2={roi[2]}, y2={roi[3]}"
         )
         return orig, cropped, status
     except Exception as e:
@@ -187,16 +193,26 @@ def preview_roi_handler(y1, x1, y2, x2):
 
 def site_roi_autofill(site_name):
     info = da.SITE_CATALOG.get(site_name)
+
     if info:
-        y1, x1, y2, x2 = info["roi"]
-        _state["roi"] = (y1, x1, y2, x2)
-        # Build default param checkbox selections
+        # Use Pinewood vertical strip ROI
+        if "Pinewood" in site_name or "Little Neck Creek" in site_name:
+            x1, y1, x2, y2 = PINEWOOD_ROI_XYXY
+        else:
+            x1, y1, x2, y2 = info["roi"]
+
+        _state["roi"] = (x1, y1, x2, y2)
+
         default_codes = info.get("default_params", ["00065"])
-        default_sel = [f"{code} – {da.USGS_PARAMETERS.get(code, code)}"
-                       for code in default_codes
-                       if f"{code} – {da.USGS_PARAMETERS.get(code, code)}" in PARAM_CHOICES]
-        return y1, x1, y2, x2, f"ROI auto-filled for {site_name}", default_sel
-    return 0, 0, 1080, 1920, "No default ROI – set manually.", [PARAM_CHOICES[0]]
+        default_sel = [
+            f"{code} – {da.USGS_PARAMETERS.get(code, code)}"
+            for code in default_codes
+            if f"{code} – {da.USGS_PARAMETERS.get(code, code)}" in PARAM_CHOICES
+        ]
+
+        return x1, y1, x2, y2, f"ROI auto-filled for {site_name}", default_sel
+
+    return 951, 0, 1136, 1920, "Default Pinewood vertical strip ROI loaded.", [PARAM_CHOICES[0]]
 
 
 # ---------------------------------------------------------------------------
@@ -431,10 +447,10 @@ def launch_gradio(share: bool = True, debug: bool = False):
             )
 
             with gr.Row():
-                roi_y1 = gr.Number(value=951,  label="y1 (top)")
-                roi_x1 = gr.Number(value=0,    label="x1 (left)")
-                roi_y2 = gr.Number(value=1136, label="y2 (bottom)")
-                roi_x2 = gr.Number(value=1920, label="x2 (right)")
+                roi_x1 = gr.Number(value=951,  label="x1 (left)")
+                roi_y1 = gr.Number(value=0,    label="y1 (top)")
+                roi_x2 = gr.Number(value=1136, label="x2 (right)")
+                roi_y2 = gr.Number(value=1920, label="y2 (bottom)")
 
             preview_btn = gr.Button("Preview ROI Crop")
             with gr.Row():
@@ -442,23 +458,23 @@ def launch_gradio(share: bool = True, debug: bool = False):
                 cropped_img = gr.Image(label="Cropped ROI",     type="pil")
             roi_status = gr.Textbox(label="ROI Status", interactive=False)
 
-            def _save_roi(y1, x1, y2, x2):
-                _state["roi"] = (int(y1), int(x1), int(y2), int(x2))
+            def _save_roi(x1, y1, x2, y2):
+                _state["roi"] = (int(x1), int(y1), int(x2), int(y2))
 
-            for src in [roi_y1, roi_x1, roi_y2, roi_x2]:
+            for src in [roi_x1, roi_y1, roi_x2, roi_y2]:
                 src.change(fn=_save_roi,
-                           inputs=[roi_y1, roi_x1, roi_y2, roi_x2],
+                           inputs=[roi_x1, roi_y1, roi_x2, roi_y2],
                            outputs=None)  # must be None, not [] – Gradio 5 crashes on empty list
 
             # Auto-fill ROI when site changes in Tab 1
             site_dd.change(
                 fn=site_roi_autofill,
                 inputs=site_dd,
-                outputs=[roi_y1, roi_x1, roi_y2, roi_x2, roi_status, param_checks],
+                outputs=[roi_x1, roi_y1, roi_x2, roi_y2, roi_status, param_checks],
             )
             preview_btn.click(
                 fn=preview_roi_handler,
-                inputs=[roi_y1, roi_x1, roi_y2, roi_x2],
+                inputs=[roi_x1, roi_y1, roi_x2, roi_y2],
                 outputs=[orig_img, cropped_img, roi_status],
             )
 

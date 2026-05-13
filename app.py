@@ -327,7 +327,15 @@ SITE_CHOICES  = list(da.SITE_CATALOG.keys())
 def launch_gradio(share: bool = True, debug: bool = False):
     """Build and launch the Gradio app."""
 
-    with gr.Blocks(title="Water Level Prediction – Training Demo") as demo:
+    with gr.Blocks(
+        title="Water Level Prediction – Training Demo",
+        css=CSS,
+        theme=gr.themes.Soft(
+            primary_hue="blue",
+            secondary_hue="sky",
+            neutral_hue="slate",
+        ),
+    ) as demo:
 
         gr.Markdown(
             """
@@ -554,12 +562,6 @@ def launch_gradio(share: bool = True, debug: bool = False):
     demo.launch(
         share=share,
         debug=debug,
-        css=CSS,
-        theme=gr.themes.Soft(
-            primary_hue="blue",
-            secondary_hue="sky",
-            neutral_hue="slate",
-        ),
     )
     return demo
 

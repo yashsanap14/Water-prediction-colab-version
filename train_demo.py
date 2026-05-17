@@ -405,6 +405,7 @@ class EfficientNetRegressor(nn.Module):
             n_features = feat.shape[1]
 
         self.model.classifier = _RegressionHead(n_features)
+        self.model = self.model.to(device)
 
     def forward(self, x):
         return self.model(x)

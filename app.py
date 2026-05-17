@@ -27,9 +27,12 @@ import data_acquisition as da
 # Paths – auto-detect Colab vs local
 # ---------------------------------------------------------------------------
 if os.path.exists("/content"):
-    BASE_DIR = "/content/water_level_demo"
+    BASE_DIR = os.environ.get("WATER_LEVEL_DEMO_BASE_DIR", "/content/water_level_demo")
 else:
-    BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "water_level_demo")
+    BASE_DIR = os.environ.get(
+        "WATER_LEVEL_DEMO_BASE_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "water_level_demo"),
+    )
 
 DATA_DIR    = os.path.join(BASE_DIR, "data")
 IMAGES_DIR  = os.path.join(DATA_DIR, "images")
@@ -98,7 +101,7 @@ def start_acquisition(site_name, start_date, end_date, max_images,
     """Gradio click handler – streams acquisition log."""
 
     if not site_name:
-        yield "Please select a site."
+        yield "Please select a site.", get_acquisition_summary()
         return
 
     # Resolve selected parameter codes from checkbox labels
@@ -107,7 +110,7 @@ def start_acquisition(site_name, start_date, end_date, max_images,
     param_codes = [code_map[s] for s in param_selection if s in code_map]
 
     if not param_codes:
-        yield "Please select at least one USGS parameter."
+        yield "Please select at least one USGS parameter.", get_acquisition_summary()
         return
 
     # Flush queue
@@ -123,19 +126,24 @@ def start_acquisition(site_name, start_date, end_date, max_images,
     t.start()
 
     log_lines = []
+    done_ok = False
     while True:
         try:
             line = _acq_queue.get(timeout=300)
         except queue.Empty:
             log_lines.append("Timeout – no output for 5 minutes.")
             break
-        if line in ("__DONE_OK__", "__DONE_ERR__"):
+        if line == "__DONE_OK__":
+            done_ok = True
+            break
+        if line == "__DONE_ERR__":
             break
         log_lines.append(line)
-        yield "\n".join(log_lines)
+        yield "\n".join(log_lines), "Acquisition running..."
 
     t.join(timeout=10)
-    yield "\n".join(log_lines)
+    summary = get_acquisition_summary() if done_ok else "Acquisition failed. Dataset summary unchanged."
+    yield "\n".join(log_lines), summary
 
 
 def get_acquisition_summary():
@@ -203,16 +211,15 @@ def site_roi_autofill(site_name):
 
         _state["roi"] = (x1, y1, x2, y2)
 
-        default_codes = info.get("default_params", ["00065"])
-        default_sel = [
-            f"{code} – {da.USGS_PARAMETERS.get(code, code)}"
-            for code in default_codes
-            if f"{code} – {da.USGS_PARAMETERS.get(code, code)}" in PARAM_CHOICES
-        ]
+        default_sel = _default_param_selection(site_name)
 
         return x1, y1, x2, y2, f"ROI auto-filled for {site_name}", default_sel
 
-    return 951, 0, 1136, 1920, "Default Pinewood vertical strip ROI loaded.", [PARAM_CHOICES[0]]
+    return (
+        951, 0, 1136, 1920,
+        "Default Pinewood vertical strip ROI loaded.",
+        _default_param_selection(SITE_CHOICES[0]),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -332,12 +339,25 @@ body { font-family: 'Inter', sans-serif; }
     border-bottom: 2px solid #bfdbfe; padding-bottom: 4px; margin-bottom: 8px;
 }
 .status-box { font-family: monospace; font-size: 0.85em; }
-.log-box    { font-family: monospace; font-size: 0.82em; background: #0f172a;
-              color: #94a3b8; border-radius: 6px; padding: 8px; }
+.log-box    { font-family: monospace; font-size: 0.82em; background: #f1f5f9;
+              color: #1e293b; border-radius: 6px; padding: 8px; }
 """
 
 PARAM_CHOICES = [f"{code} – {label}" for code, label in da.USGS_PARAMETERS.items()]
 SITE_CHOICES  = list(da.SITE_CATALOG.keys())
+
+
+def _param_labels_for_codes(codes):
+    return [
+        f"{code} – {da.USGS_PARAMETERS.get(code, code)}"
+        for code in codes
+        if f"{code} – {da.USGS_PARAMETERS.get(code, code)}" in PARAM_CHOICES
+    ]
+
+
+def _default_param_selection(site_name):
+    site_info = da.SITE_CATALOG.get(site_name, {})
+    return _param_labels_for_codes(site_info.get("default_params", []))
 
 
 def launch_gradio(share: bool = True, debug: bool = False):
@@ -346,10 +366,10 @@ def launch_gradio(share: bool = True, debug: bool = False):
     with gr.Blocks(
         title="Water Level Prediction – Training Demo",
         css=CSS,
-        theme=gr.themes.Soft(
+        theme=gr.themes.Default(
             primary_hue="blue",
             secondary_hue="sky",
-            neutral_hue="slate",
+            neutral_hue="gray",
         ),
     ) as demo:
 
@@ -395,7 +415,7 @@ def launch_gradio(share: bool = True, debug: bool = False):
                 with gr.Column(scale=2):
                     param_checks = gr.CheckboxGroup(
                         choices=PARAM_CHOICES,
-                        value=["00065 – Gage height (ft)"],
+                        value=_default_param_selection(SITE_CHOICES[0]),
                         label="USGS Parameters to include in CSV",
                     )
                     api_key_in = gr.Textbox(
@@ -426,12 +446,7 @@ def launch_gradio(share: bool = True, debug: bool = False):
                 fn=start_acquisition,
                 inputs=[site_dd, start_date_in, end_date_in,
                         max_img_slider, param_checks, api_key_in],
-                outputs=acq_log,
-            )
-            acq_btn.click(
-                fn=get_acquisition_summary,
-                inputs=[],
-                outputs=acq_summary,
+                outputs=[acq_log, acq_summary],
             )
 
         # ===================================================================

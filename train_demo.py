@@ -2,7 +2,7 @@
 train_demo.py
 =============
 Water Level Prediction Training Module – Google Colab Demo Version
-Adapted from MAIN2.ipynb (production pipeline).
+Adapted from the production training pipeline.
 
 Key changes from production:
   - No AWS / S3 / boto3 dependencies
@@ -56,7 +56,7 @@ from tqdm import tqdm
 # ImageNet normalisation (same as production)
 MODEL_CONFIG = {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}
 
-# Default Pinewood ROI  (y1, x1, y2, x2)
+# Default Pinewood ROI  (x1, y1, x2, y2)  – XYXY format (vertical gauge strip)
 DEFAULT_ROI = {
     "Pinewood Road": (951, 0, 1136, 1920),
 }
@@ -200,11 +200,12 @@ def build_image_label_mapping(
 def preview_roi(image_path: str, roi: Tuple) -> Tuple:
     """
     Returns (original_pil, cropped_pil) for the given image and ROI.
-    roi = (y1, x1, y2, x2)
+    roi = (x1, y1, x2, y2)  – XYXY format
+    PIL.Image.crop() expects (left, upper, right, lower) = (x1, y1, x2, y2)
     """
     from PIL import Image
     img = Image.open(image_path).convert("RGB")
-    y1, x1, y2, x2 = roi
+    x1, y1, x2, y2 = roi
     cropped = img.crop((x1, y1, x2, y2))
     return img, cropped
 
@@ -235,7 +236,7 @@ class WaterLevelDataset(Dataset):
         self.image_paths = list(mappings.keys())
         self.targets_raw = [mappings[p] for p in self.image_paths]
         self.training    = training
-        self.roi         = roi           # (y1, x1, y2, x2) or None
+        self.roi         = roi           # (x1, y1, x2, y2) XYXY or None
 
         # ── Target scaling ────────────────────────────────────────────────
         if scaler is None:
@@ -279,8 +280,9 @@ class WaterLevelDataset(Dataset):
             image = read_image(path).float() / 255.0
 
             # ROI crop (production Datasets.py crops before resize)
+            # roi is (x1, y1, x2, y2) XYXY; tensor is [C, H, W] so crop as [:, y1:y2, x1:x2]
             if self.roi is not None:
-                y1, x1, y2, x2 = self.roi
+                x1, y1, x2, y2 = self.roi
                 # Clamp to actual image dimensions
                 _, H, W = image.shape
                 y1c, y2c = max(0, y1), min(H, y2)
@@ -330,7 +332,7 @@ class _RegressionHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# EfficientNet regression model  (mirrors Section 4 of MAIN2.ipynb)
+# EfficientNet regression model
 # ---------------------------------------------------------------------------
 
 class EfficientNetRegressor(nn.Module):
@@ -388,17 +390,47 @@ def split_mappings(
     """
     paths   = list(mappings.keys())
     targets = [mappings[p] for p in paths]
+    n_samples = len(paths)
+
+    if n_samples < 3:
+        raise ValueError(
+            "At least 3 labelled images are required to create train, validation, "
+            f"and test splits. Found {n_samples}."
+        )
+
+    if val_ratio <= 0:
+        raise ValueError("Validation split must be greater than 0.")
+    if test_ratio <= 0:
+        raise ValueError("Test split must be greater than 0.")
+    if val_ratio + test_ratio >= 1:
+        raise ValueError(
+            "Validation split plus test split must be less than 1. "
+            f"Got val_ratio={val_ratio} and test_ratio={test_ratio}."
+        )
 
     # First split off the test set
     idx_trainval = list(range(len(paths)))
-    idx_trainval, idx_test = train_test_split(
-        idx_trainval, test_size=test_ratio, random_state=seed
-    )
-    # Then split val from trainval
-    val_ratio_adj = val_ratio / (1.0 - test_ratio)
-    idx_train, idx_val = train_test_split(
-        idx_trainval, test_size=val_ratio_adj, random_state=seed
-    )
+    try:
+        idx_trainval, idx_test = train_test_split(
+            idx_trainval, test_size=test_ratio, random_state=seed
+        )
+        # Then split val from trainval
+        val_ratio_adj = val_ratio / (1.0 - test_ratio)
+        idx_train, idx_val = train_test_split(
+            idx_trainval, test_size=val_ratio_adj, random_state=seed
+        )
+    except ValueError as e:
+        raise ValueError(
+            "Could not create non-empty train, validation, and test splits. "
+            "Use more labelled images or reduce the validation/test split ratios. "
+            f"Details: {e}"
+        ) from e
+
+    if not idx_train or not idx_val or not idx_test:
+        raise ValueError(
+            "Train, validation, and test splits must each contain at least one image. "
+            "Use more labelled images or adjust the split ratios."
+        )
 
     def _make(idxs):
         return {paths[i]: targets[i] for i in idxs}
@@ -432,7 +464,7 @@ def train_model(
     """
     Full training pipeline. Returns dict with losses and output paths.
 
-    Follows MAIN2.ipynb steps 8-11 exactly.
+    Follows the production training flow.
     """
 
     os.makedirs(results_dir, exist_ok=True)

@@ -120,6 +120,8 @@ USGS_PARAMETERS: Dict[str, str] = {
     "00300": "Dissolved oxygen (mg/L)",
 }
 
+WATER_LEVEL_TARGET_CODES = ("62620", "00065", "00060")
+
 # ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
@@ -435,23 +437,42 @@ def build_labels_csv(downloaded: List[dict], usgs_df: pd.DataFrame,
         direction="nearest",
     )
 
-    sensor_cols = [c for c in merged.columns if c not in ("image_path", "dt_image", "datetime")]
     before = len(merged)
-    merged = merged.dropna(subset=sensor_cols, how="all")
-    matched = len(merged)
 
-    if log_cb:
-        log_cb(f"  Matched: {matched}/{before} images (within 15 min).")
-
-    # Rename primary water level column for train_demo compatibility
+    # Rename primary water level column for train_demo compatibility.
+    # Precipitation or other environmental readings are useful features in the
+    # CSV, but they must not make a row trainable without a numeric target.
     merged = merged.rename(columns={"dt_image": "timestamp"})
-    for code in ("00065", "62620", "00060"):
+    target_col = None
+    for code in WATER_LEVEL_TARGET_CODES:
         candidates = [c for c in merged.columns if c.startswith(code + "_")]
         if candidates:
-            merged = merged.rename(columns={candidates[0]: "water_level"})
+            target_col = candidates[0]
+            merged = merged.rename(columns={target_col: "water_level"})
             if log_cb:
-                log_cb(f"  Primary label column: '{candidates[0]}' -> 'water_level'")
+                log_cb(f"  Primary label column: '{target_col}' -> 'water_level'")
             break
+
+    if target_col is None:
+        requested = ", ".join(WATER_LEVEL_TARGET_CODES)
+        raise ValueError(
+            "No usable water-level target was returned by USGS. "
+            f"Select at least one water-level parameter ({requested}); "
+            "precipitation-only data cannot be used for training."
+        )
+
+    merged["water_level"] = pd.to_numeric(merged["water_level"], errors="coerce")
+    merged = merged.dropna(subset=["water_level"])
+    matched = len(merged)
+
+    if matched == 0:
+        raise ValueError(
+            "No images matched a valid numeric water_level value within 15 minutes. "
+            "Try a different date range, site, or water-level parameter."
+        )
+
+    if log_cb:
+        log_cb(f"  Matched: {matched}/{before} images with valid water_level values.")
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     merged.to_csv(output_path, index=False)

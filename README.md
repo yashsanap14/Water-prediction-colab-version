@@ -91,7 +91,6 @@ Water-prediction-colab-version/
 ├── data_acquisition.py           # HiVIS + NWIS data pipeline
 ├── train_demo.py                 # ML training module
 ├── Water_Level_Training_Demo.ipynb  # Colab notebook wrapper
-├── MAIN2.ipynb                   # Production training pipeline (S3-based)
 ├── .gitignore                    # Excludes images, models, cache
 └── README.md                     # This file
 ```
@@ -170,14 +169,14 @@ GET https://waterservices.usgs.gov/nwis/iv/
 
 **File:** `app.py` Tab 2, calls `train_demo.preview_roi()`
 
-The **Region of Interest (ROI)** crops the camera image to focus on the water surface, removing sky, vegetation, and camera housing. Defined as `(y1, x1, y2, x2)` pixel coordinates.
+The **Region of Interest (ROI)** crops the camera image to focus on the water surface, removing sky, vegetation, and camera housing. Defined as `(x1, y1, x2, y2)` pixel coordinates.
 
 - ROI **auto-fills** from the site catalog when you select a site
 - A sample image is displayed before and after cropping for visual verification
 - ROI is stored in `_state["roi"]` and passed to the training Dataset
 
 **Default ROI for Pinewood Road site:** `(951, 0, 1136, 1920)`  
-→ Crops to a 185px tall horizontal strip across the full 1920px width
+→ Crops to a 185px wide vertical strip across the full 1920px height
 
 ---
 
@@ -193,7 +192,7 @@ Configurable parameters in the UI:
 | Epochs | 5 | Training iterations over the dataset |
 | Batch size | 4 | Images per gradient step |
 | Image size | 384px | Input resolution to the model |
-| Learning rate | 2e-4 | Initial learning rate (same as MAIN2.ipynb) |
+| Learning rate | 2e-4 | Initial learning rate |
 | Validation split | 15% | Fraction held out for validation |
 | Test split | 10% | Fraction held out for final evaluation |
 | Backbone freeze ratio | 0.7 | Fraction of backbone layers frozen (0=all trainable) |
@@ -213,8 +212,7 @@ Configurable parameters in the UI:
    c. Backward pass + Adam optimizer step
    d. Validation loss logged to queue → streamed to Gradio log box
    e. If val_loss improved → save best_model.pth
-6. Early stopping if no improvement for 3 epochs
-7. Plot train vs val loss → training_loss_plot.png
+6. Plot train vs val loss → training_loss_plot.png
 ```
 
 #### Data Augmentation (training only)
@@ -341,7 +339,7 @@ Input Image (H×W×3)
 | `build_image_label_mapping()` | Creates `{abs_path: float}` dict for the Dataset |
 | `WaterLevelDataset` | PyTorch Dataset with ROI crop + augmentation |
 | `EfficientNetRegressor` | Model class wrapping `timm` backbone + regression head |
-| `train_model()` | Full training loop with checkpointing, logging, early stopping |
+| `train_model()` | Full training loop with checkpointing and logging |
 | `preview_roi()` | Returns PIL images (original + cropped) for Tab 2 preview |
 | `check_gpu()` | Prints GPU/CPU status on startup |
 
@@ -394,7 +392,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install dependencies
-pip install torch torchvision timm gradio scikit-learn pandas numpy matplotlib requests tqdm Pillow
+pip install -r requirements.txt
 ```
 
 ### Launch
@@ -413,10 +411,11 @@ Opens at: **http://127.0.0.1:7860**
 # Cell 1: Clone and install
 !git clone https://github.com/yashsanap14/Water-prediction-colab-version.git
 %cd Water-prediction-colab-version
-!pip install timm gradio requests -q
+!pip install -r requirements.txt -q
 
 # Cell 2: Launch with public share link
-import sys
+import os, sys
+os.environ["WATER_LEVEL_DEMO_BASE_DIR"] = os.path.join(os.getcwd(), "water_level_demo")
 sys.path.insert(0, '.')
 import app
 app.launch_gradio(share=True)

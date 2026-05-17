@@ -10,6 +10,7 @@ Workflow:
 """
 
 import os
+import random
 import threading
 import queue
 import traceback
@@ -48,6 +49,7 @@ for d in [BASE_DIR, DATA_DIR, IMAGES_DIR, RESULTS_DIR]:
 _state = {
     "mappings":   None,   # {abs_image_path: float water_level}
     "roi":        (951, 0, 1136, 1920),   # x1, y1, x2, y2 – vertical gauge strip
+    "roi_mode":   "Whole image",
     "csv_path":   None,
 }
 
@@ -167,6 +169,210 @@ def get_acquisition_summary():
 
 # Pinewood vertical gauge strip – x1, y1, x2, y2 (XYXY format)
 PINEWOOD_ROI_XYXY = (951, 0, 1136, 1920)
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+
+
+def _format_roi(roi):
+    if roi is None:
+        return ""
+    x1, y1, x2, y2 = [int(v) for v in roi]
+    return f"({x1}, {y1}, {x2}, {y2})"
+
+
+def _available_image_paths():
+    mappings = _state.get("mappings")
+    if mappings:
+        return [
+            p for p in mappings.keys()
+            if os.path.exists(p) and p.lower().endswith(IMAGE_EXTENSIONS)
+        ]
+    if not os.path.isdir(IMAGES_DIR):
+        return []
+    return [
+        os.path.join(IMAGES_DIR, f)
+        for f in os.listdir(IMAGES_DIR)
+        if f.lower().endswith(IMAGE_EXTENSIONS)
+    ]
+
+
+def _image_size(path):
+    with Image.open(path) as img:
+        return img.size
+
+
+def _validate_roi(roi, bounds):
+    if roi is None:
+        raise ValueError("Please select an ROI before starting ROI-based training.")
+
+    try:
+        x1, y1, x2, y2 = [int(v) for v in roi]
+    except (TypeError, ValueError):
+        raise ValueError("ROI coordinates must be integers in the format (x1, y1, x2, y2).")
+
+    if x1 >= x2 or y1 >= y2:
+        raise ValueError("ROI coordinates must satisfy x1 < x2 and y1 < y2.")
+
+    width, height = bounds
+    if x1 < 0 or y1 < 0 or x2 > width or y2 > height:
+        raise ValueError(
+            "ROI coordinates must be within image boundaries. "
+            f"Image size is {width}x{height}; got {_format_roi((x1, y1, x2, y2))}."
+        )
+
+    return (x1, y1, x2, y2)
+
+
+def _preview_path(sample_path=None):
+    if sample_path and os.path.exists(sample_path):
+        return sample_path
+    images = _available_image_paths()
+    if not images:
+        raise ValueError("No images found. Run Data Acquisition first.")
+    return images[0]
+
+
+def set_roi_mode(mode):
+    _state["roi_mode"] = mode
+    if mode == "Whole image":
+        return (
+            gr.update(visible=False),
+            "Whole image mode selected. Training will use full original images.",
+            None,
+            "",
+            None,
+            [],
+        )
+    return (
+        gr.update(visible=True),
+        "ROI cropped image mode selected. Load a sample image and select two corners.",
+        None,
+        "",
+        None,
+        [],
+    )
+
+
+def load_random_sample_image():
+    images = _available_image_paths()
+    if not images:
+        return (
+            None,
+            None,
+            None,
+            [],
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+            "No images found. Run Data Acquisition first.",
+        )
+
+    img_path = random.choice(images)
+    img = Image.open(img_path).convert("RGB")
+    width, height = img.size
+    return (
+        img,
+        img_path,
+        (width, height),
+        [],
+        "",
+        None,
+        None,
+        None,
+        None,
+        None,
+        f"Loaded sample: {os.path.basename(img_path)} ({width}x{height}). Click two corners to select an ROI.",
+    )
+
+
+def apply_manual_roi(x1, y1, x2, y2, sample_path, sample_size):
+    try:
+        img_path = _preview_path(sample_path)
+        bounds = sample_size or _image_size(img_path)
+        roi = _validate_roi((x1, y1, x2, y2), bounds)
+        orig, cropped = td.preview_roi(img_path, roi)
+        _state["roi"] = roi
+        return (
+            orig,
+            cropped,
+            _format_roi(roi),
+            f"ROI selected: {_format_roi(roi)}",
+            roi,
+            [],
+        )
+    except Exception as e:
+        return None, None, "", f"ROI preview failed: {e}", None, []
+
+
+def select_roi_point(sample_path, sample_size, clicks, current_roi, evt: gr.SelectData):
+    try:
+        if not sample_path or not os.path.exists(sample_path):
+            raise ValueError("Load a random sample image before selecting an ROI.")
+        if not sample_size:
+            sample_size = _image_size(sample_path)
+
+        point = evt.index
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            raise ValueError("Could not read the selected image point.")
+
+        x, y = int(point[0]), int(point[1])
+        width, height = sample_size
+        if x < 0 or y < 0 or x >= width or y >= height:
+            raise ValueError(
+                f"Selected point ({x}, {y}) is outside image boundaries {width}x{height}."
+            )
+
+        clicks = [] if not clicks or len(clicks) >= 2 else list(clicks)
+        clicks.append((x, y))
+
+        if len(clicks) == 1:
+            return (
+                gr.update(),
+                None,
+                _format_roi(current_roi),
+                f"First corner selected at ({x}, {y}). Click the opposite corner.",
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                current_roi,
+                clicks,
+            )
+
+        (x_a, y_a), (x_b, y_b) = clicks
+        roi = _validate_roi(
+            (min(x_a, x_b), min(y_a, y_b), max(x_a, x_b), max(y_a, y_b)),
+            sample_size,
+        )
+        orig, cropped = td.preview_roi(sample_path, roi)
+        _state["roi"] = roi
+        return (
+            orig,
+            cropped,
+            _format_roi(roi),
+            f"ROI selected: {_format_roi(roi)}",
+            roi[0],
+            roi[1],
+            roi[2],
+            roi[3],
+            roi,
+            clicks,
+        )
+    except Exception as e:
+        return (
+            gr.update(),
+            None,
+            _format_roi(current_roi),
+            f"ROI selection failed: {e}",
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            current_roi,
+            clicks or [],
+        )
 
 
 def preview_roi_handler(x1, y1, x2, y2):
@@ -238,28 +444,117 @@ def _training_thread(kwargs):
         _train_result.update(result)
         _log_queue.put("__DONE__")
     except Exception as e:
-        _log_queue.put(f"Training error: {e}\n{traceback.format_exc()}")
+        _log_queue.put(f"Training error: {e}")
         _log_queue.put("__DONE__")
 
 
+def training_config_mode_changed(mode):
+    best = td.BEST_TRAINING_CONFIG
+    if mode == "Best configuration for training":
+        return (
+            gr.update(visible=False),
+            td.BEST_TRAINING_SUMMARY,
+            best["num_epochs"],
+            best["batch_size"],
+            best["input_img_size"],
+            best["learning_rate"],
+            best["val_ratio"],
+            best["test_ratio"],
+            best["param_freeze_ratio"],
+            best["random_state"],
+            True,
+        )
+    return (
+        gr.update(visible=True),
+        "Manual setup selected. Use the controls below to choose custom hyperparameters.",
+        5,
+        4,
+        384,
+        2e-4,
+        0.15,
+        0.10,
+        0.7,
+        42,
+        True,
+    )
+
+
+def _validate_manual_training_values(
+    num_images, n_epochs, batch_size, img_size,
+    learning_rate, val_ratio, test_ratio,
+):
+    if int(num_images) <= 0:
+        raise ValueError("Number of images must be greater than 0.")
+    if int(img_size) <= 0:
+        raise ValueError("Image size must be greater than 0.")
+    if int(batch_size) <= 0:
+        raise ValueError("Batch size must be greater than 0.")
+    if float(learning_rate) <= 0:
+        raise ValueError("Learning rate must be greater than 0.")
+    if int(n_epochs) <= 0:
+        raise ValueError("Epochs must be greater than 0.")
+    if float(val_ratio) <= 0:
+        raise ValueError("Validation split must be greater than 0.")
+    if float(test_ratio) <= 0:
+        raise ValueError("Test split must be greater than 0.")
+    if float(val_ratio) + float(test_ratio) >= 1:
+        raise ValueError("Validation split plus test split must be less than 1.")
+
+
 def start_training(
+    training_config_mode,
+    site_name,
     num_images, n_epochs, batch_size, img_size,
     learning_rate, val_ratio, test_ratio,
     freeze_ratio, seed,
     use_small_backbone, save_to_drive,
+    roi_mode, selected_roi, sample_size,
 ):
     mappings = _state.get("mappings")
     if not mappings:
-        yield "No dataset loaded. Please run Data Acquisition first."
+        yield "No dataset loaded. Please run Data Acquisition first.", None, None, ""
         return
 
-    n = min(int(num_images), len(mappings))
+    use_best_config = training_config_mode == "Best configuration for training"
+    config_mode = "best" if use_best_config else "manual"
+
+    if not use_best_config:
+        try:
+            _validate_manual_training_values(
+                num_images, n_epochs, batch_size, img_size,
+                learning_rate, val_ratio, test_ratio,
+            )
+        except ValueError as e:
+            yield str(e), None, None, ""
+            return
+
+    if roi_mode == "Whole image":
+        roi = None
+    else:
+        try:
+            bounds = sample_size
+            if not bounds:
+                first_image = next(iter(mappings.keys()))
+                bounds = _image_size(first_image)
+            roi = _validate_roi(selected_roi, bounds)
+        except ValueError as e:
+            yield str(e), None, None, ""
+            return
+
+    n = len(mappings) if use_best_config else min(int(num_images), len(mappings))
     keys = list(mappings.keys())
     rng = np.random.default_rng(int(seed))
     chosen = rng.choice(len(keys), size=n, replace=False)
     sub = {keys[i]: mappings[keys[i]] for i in chosen}
 
-    roi = _state.get("roi", (951, 0, 1136, 1920))
+    if roi is not None:
+        try:
+            for img_path in sub.keys():
+                _validate_roi(roi, _image_size(img_path))
+        except ValueError as e:
+            yield f"Selected ROI is not valid for all training images. {e}", None, None, ""
+            return
+
     backbone = ("tf_efficientnet_b3.ns_jft_in1k" if use_small_backbone
                 else "tf_efficientnet_l2.ns_jft_in1k")
 
@@ -276,6 +571,8 @@ def start_training(
         param_freeze_ratio = float(freeze_ratio),
         seed               = int(seed),
         backbone_name      = backbone,
+        config_mode        = config_mode,
+        site_name          = site_name,
         save_to_drive      = bool(save_to_drive),
         drive_dir          = DRIVE_DIR,
     )
@@ -297,18 +594,26 @@ def start_training(
         if line == "__DONE__":
             break
         log_lines.append(line)
-        yield "\n".join(log_lines)
+        yield "\n".join(log_lines), None, None, "Training is running. Results will appear here when it finishes."
 
     thread.join(timeout=5)
-    yield "\n".join(log_lines)
+    loss_img, pred_img, summary = get_training_outputs()
+    yield "\n".join(log_lines), loss_img, pred_img, summary
 
 
 def get_training_outputs():
     if not _train_result:
-        return None, "No results yet. Run training first."
+        return None, None, "No results yet. Run training first."
 
-    plot_path = _train_result.get("plot_path")
-    img = Image.open(plot_path) if plot_path and os.path.exists(plot_path) else None
+    plot_path = (
+        _train_result.get("loss_plot_path")
+        or _train_result.get("loss_curves_site_path")
+        or _train_result.get("plot_path")
+    )
+    loss_img = Image.open(plot_path) if plot_path and os.path.exists(plot_path) else None
+    pred_path = _train_result.get("predictions_plot_path")
+    pred_img = Image.open(pred_path) if pred_path and os.path.exists(pred_path) else None
+    metrics_summary = _train_result.get("metrics_summary", "N/A")
 
     t = _train_result.get("total_time_s", 0)
     h, rem = divmod(int(t), 3600)
@@ -321,11 +626,16 @@ def get_training_outputs():
         f"Best validation loss : {bvl_s}\n"
         f"Training time        : {h}h {m}m {s}s\n"
         f"Best model           : {_train_result.get('best_model_path', 'N/A')}\n"
+        f"Site model           : {_train_result.get('best_model_site_path', 'N/A')}\n"
         f"Scaler               : {_train_result.get('scaler_path', 'N/A')}\n"
-        f"Loss plot            : {_train_result.get('plot_path', 'N/A')}\n"
+        f"Test results         : {_train_result.get('test_results_csv_path') or _train_result.get('test_results_path', 'N/A')}\n"
+        f"Predictions plot     : {_train_result.get('predictions_plot_path') or 'Not generated'}\n"
+        f"Test metrics         : {metrics_summary}\n"
+        f"Loss plot            : {plot_path or 'N/A'}\n"
+        f"Site loss curves     : {_train_result.get('loss_curves_site_path', 'N/A')}\n"
         f"Config               : {_train_result.get('config_path', 'N/A')}\n"
     )
-    return img, summary
+    return loss_img, pred_img, summary
 
 
 # ---------------------------------------------------------------------------
@@ -456,30 +766,68 @@ def launch_gradio(share: bool = True, debug: bool = False):
             gr.Markdown("### Step 2 – Region of Interest",
                         elem_classes="section-header")
 
-            gr.Markdown(
-                "The ROI is **auto-filled** from the site you selected in Tab 1. "
-                "Adjust if needed, then click **Preview**."
+            roi_mode = gr.Radio(
+                choices=["Whole image", "ROI cropped image"],
+                value="Whole image",
+                label="Training Image Mode",
+            )
+            roi_mode_status = gr.Textbox(
+                label="Mode Status",
+                value="Whole image mode selected. Training will use full original images.",
+                interactive=False,
+            )
+            selected_roi_state = gr.State(None)
+            roi_clicks_state = gr.State([])
+            roi_sample_path_state = gr.State(None)
+            roi_sample_size_state = gr.State(None)
+
+            with gr.Group(visible=False) as roi_controls:
+                gr.Markdown(
+                    "Load a random sample image, click two opposite corners to select "
+                    "a rectangular ROI, or use the manual coordinate fields."
+                )
+                load_sample_btn = gr.Button("Load Random Sample Image")
+
+                roi_sample_img = gr.Image(
+                    label="Sample Image",
+                    type="pil",
+                    interactive=False,
+                )
+
+                roi_coord_text = gr.Textbox(
+                    label="Selected ROI Coordinates",
+                    placeholder="(x1, y1, x2, y2)",
+                    interactive=False,
+                )
+
+                with gr.Row():
+                    roi_x1 = gr.Number(value=951,  label="x1 (left)")
+                    roi_y1 = gr.Number(value=0,    label="y1 (top)")
+                    roi_x2 = gr.Number(value=1136, label="x2 (right)")
+                    roi_y2 = gr.Number(value=1920, label="y2 (bottom)")
+
+                preview_btn = gr.Button("Preview/Apply Manual ROI")
+                cropped_img = gr.Image(label="Crop Preview", type="pil")
+                roi_status = gr.Textbox(label="ROI Status", interactive=False)
+
+            roi_mode.change(
+                fn=set_roi_mode,
+                inputs=roi_mode,
+                outputs=[
+                    roi_controls, roi_mode_status, selected_roi_state,
+                    roi_coord_text, cropped_img, roi_clicks_state,
+                ],
             )
 
-            with gr.Row():
-                roi_x1 = gr.Number(value=951,  label="x1 (left)")
-                roi_y1 = gr.Number(value=0,    label="y1 (top)")
-                roi_x2 = gr.Number(value=1136, label="x2 (right)")
-                roi_y2 = gr.Number(value=1920, label="y2 (bottom)")
-
-            preview_btn = gr.Button("Preview ROI Crop")
-            with gr.Row():
-                orig_img    = gr.Image(label="Original Image",  type="pil")
-                cropped_img = gr.Image(label="Cropped ROI",     type="pil")
-            roi_status = gr.Textbox(label="ROI Status", interactive=False)
-
-            def _save_roi(x1, y1, x2, y2):
-                _state["roi"] = (int(x1), int(y1), int(x2), int(y2))
-
-            for src in [roi_x1, roi_y1, roi_x2, roi_y2]:
-                src.change(fn=_save_roi,
-                           inputs=[roi_x1, roi_y1, roi_x2, roi_y2],
-                           outputs=None)  # must be None, not [] – Gradio 5 crashes on empty list
+            load_sample_btn.click(
+                fn=load_random_sample_image,
+                inputs=[],
+                outputs=[
+                    roi_sample_img, roi_sample_path_state, roi_sample_size_state,
+                    roi_clicks_state, roi_coord_text, cropped_img,
+                    roi_x1, roi_y1, roi_x2, roi_y2, roi_status,
+                ],
+            )
 
             # Auto-fill ROI when site changes in Tab 1
             site_dd.change(
@@ -488,9 +836,27 @@ def launch_gradio(share: bool = True, debug: bool = False):
                 outputs=[roi_x1, roi_y1, roi_x2, roi_y2, roi_status, param_checks],
             )
             preview_btn.click(
-                fn=preview_roi_handler,
-                inputs=[roi_x1, roi_y1, roi_x2, roi_y2],
-                outputs=[orig_img, cropped_img, roi_status],
+                fn=apply_manual_roi,
+                inputs=[
+                    roi_x1, roi_y1, roi_x2, roi_y2,
+                    roi_sample_path_state, roi_sample_size_state,
+                ],
+                outputs=[
+                    roi_sample_img, cropped_img, roi_coord_text,
+                    roi_status, selected_roi_state, roi_clicks_state,
+                ],
+            )
+            roi_sample_img.select(
+                fn=select_roi_point,
+                inputs=[
+                    roi_sample_path_state, roi_sample_size_state,
+                    roi_clicks_state, selected_roi_state,
+                ],
+                outputs=[
+                    roi_sample_img, cropped_img, roi_coord_text, roi_status,
+                    roi_x1, roi_y1, roi_x2, roi_y2,
+                    selected_roi_state, roi_clicks_state,
+                ],
             )
 
         # ===================================================================
@@ -500,45 +866,72 @@ def launch_gradio(share: bool = True, debug: bool = False):
             gr.Markdown("### Step 3 – Configure and Start Training",
                         elem_classes="section-header")
 
-            with gr.Row():
-                with gr.Column():
-                    t_num_images = gr.Slider(50, 500, value=200, step=10,
-                                            label="Number of images to train on")
-                    t_epochs     = gr.Slider(1, 20, value=5, step=1,
-                                            label="Epochs")
-                    t_batch      = gr.Dropdown(choices=[2, 4, 8, 16], value=4,
-                                              label="Batch size")
-                    t_img_size   = gr.Dropdown(choices=[224, 384, 512, 600],
-                                              value=384,
-                                              label="Input image size (px)")
-                with gr.Column():
-                    t_lr         = gr.Number(value=2e-4, label="Learning rate",
-                                            precision=6)
-                    t_val_ratio  = gr.Number(value=0.15, label="Validation split",
-                                            precision=2)
-                    t_test_ratio = gr.Number(value=0.10, label="Test split",
-                                            precision=2)
-                    t_freeze     = gr.Slider(0.0, 1.0, value=0.7, step=0.05,
-                                            label="Backbone freeze ratio")
-                    t_seed       = gr.Number(value=42, label="Random seed",
-                                            precision=0)
-                with gr.Column():
-                    t_small_model = gr.Checkbox(
-                        value=True,
-                        label="Use EfficientNet-B3 (recommended – fits on T4 GPU)",
-                    )
-                    t_save_drive  = gr.Checkbox(
-                        value=False,
-                        label="Copy results to Google Drive",
-                    )
-                    gr.Markdown(
-                        """
-                        **GPU Memory tips (T4 – 15 GB):**
-                        - B3 + 384px + batch 4 = ~4–6 GB OK
-                        - L2 + 512px + batch 8 = likely OOM
-                        - If out-of-memory: reduce batch or image size
-                        """
-                    )
+            best_cfg = td.BEST_TRAINING_CONFIG
+            training_config_mode = gr.Radio(
+                choices=["Best configuration for training", "Manual setup"],
+                value="Best configuration for training",
+                label="Training Configuration Mode",
+            )
+            training_config_summary = gr.Textbox(
+                label="Training Configuration Summary",
+                value=td.BEST_TRAINING_SUMMARY,
+                interactive=False,
+                lines=3,
+            )
+
+            with gr.Group(visible=False) as manual_training_controls:
+                with gr.Row():
+                    with gr.Column():
+                        t_num_images = gr.Slider(50, 500, value=200, step=10,
+                                                label="Number of images to train on")
+                        t_epochs     = gr.Slider(1, 20, value=best_cfg["num_epochs"], step=1,
+                                                label="Epochs")
+                        t_batch      = gr.Dropdown(choices=[2, 4, 8, 16],
+                                                  value=best_cfg["batch_size"],
+                                                  label="Batch size")
+                        t_img_size   = gr.Dropdown(choices=[224, 384, 512, 600],
+                                                  value=best_cfg["input_img_size"],
+                                                  label="Input image size (px)")
+                    with gr.Column():
+                        t_lr         = gr.Number(value=best_cfg["learning_rate"],
+                                                label="Learning rate", precision=6)
+                        t_val_ratio  = gr.Number(value=best_cfg["val_ratio"],
+                                                label="Validation split", precision=2)
+                        t_test_ratio = gr.Number(value=best_cfg["test_ratio"],
+                                                label="Test split", precision=2)
+                        t_freeze     = gr.Slider(0.0, 1.0,
+                                                value=best_cfg["param_freeze_ratio"],
+                                                step=0.05,
+                                                label="Backbone freeze ratio")
+                        t_seed       = gr.Number(value=best_cfg["random_state"],
+                                                label="Random seed", precision=0)
+                    with gr.Column():
+                        t_small_model = gr.Checkbox(
+                            value=True,
+                            label="Use EfficientNet-B3 (recommended – fits on T4 GPU)",
+                        )
+                        gr.Markdown(
+                            """
+                            **GPU Memory tips (T4 – 15 GB):**
+                            - Best configuration uses EfficientNet-B3 at 384px, batch 8
+                            - If out-of-memory: best mode retries batch 4 automatically
+                            """
+                        )
+
+            t_save_drive  = gr.Checkbox(
+                value=False,
+                label="Copy results to Google Drive",
+            )
+
+            training_config_mode.change(
+                fn=training_config_mode_changed,
+                inputs=training_config_mode,
+                outputs=[
+                    manual_training_controls, training_config_summary,
+                    t_epochs, t_batch, t_img_size, t_lr, t_val_ratio,
+                    t_test_ratio, t_freeze, t_seed, t_small_model,
+                ],
+            )
 
             train_btn = gr.Button("Start Training", variant="primary", size="lg")
             gr.Markdown("### Live Training Log")
@@ -548,16 +941,37 @@ def launch_gradio(share: bool = True, debug: bool = False):
                 interactive=False,
                 elem_classes="log-box",
             )
+            gr.Markdown("### Training Results")
+            with gr.Row():
+                train_loss_plot = gr.Image(
+                    label="Training vs Validation Loss",
+                    type="pil",
+                )
+                train_predictions_plot = gr.Image(
+                    label="Predictions vs Actuals",
+                    type="pil",
+                )
+            train_result_summary = gr.Textbox(
+                label="Result Summary",
+                lines=8,
+                interactive=False,
+                elem_classes="status-box",
+            )
 
             train_btn.click(
                 fn=start_training,
                 inputs=[
+                    training_config_mode, site_dd,
                     t_num_images, t_epochs, t_batch, t_img_size,
                     t_lr, t_val_ratio, t_test_ratio,
                     t_freeze, t_seed,
                     t_small_model, t_save_drive,
+                    roi_mode, selected_roi_state, roi_sample_size_state,
                 ],
-                outputs=train_log,
+                outputs=[
+                    train_log, train_loss_plot,
+                    train_predictions_plot, train_result_summary,
+                ],
             )
 
         # ===================================================================
@@ -569,6 +983,7 @@ def launch_gradio(share: bool = True, debug: bool = False):
             refresh_btn = gr.Button("Load Results")
             with gr.Row():
                 loss_plot = gr.Image(label="Training Loss Plot", type="pil")
+                predictions_plot = gr.Image(label="Predictions vs Actuals", type="pil")
                 summary   = gr.Textbox(
                     label="Summary",
                     lines=12,
@@ -577,7 +992,7 @@ def launch_gradio(share: bool = True, debug: bool = False):
                 )
             refresh_btn.click(
                 fn=get_training_outputs,
-                outputs=[loss_plot, summary],
+                outputs=[loss_plot, predictions_plot, summary],
             )
 
         # Footer
@@ -586,7 +1001,8 @@ def launch_gradio(share: bool = True, debug: bool = False):
             ---
             **Outputs** saved to `water_level_demo/results/`:
             `best_model.pth` · `scaler.pkl` · `training_history.csv` ·
-            `training_loss_plot.png` · `config.json`
+            `training_loss_plot.png` · `config.json` · `test_results_<site>.csv` ·
+            `predictions_vs_actuals_<site>.png` · `loss_curves_<site>.png`
             """
         )
 

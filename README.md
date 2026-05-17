@@ -169,11 +169,12 @@ GET https://waterservices.usgs.gov/nwis/iv/
 
 **File:** `app.py` Tab 2, calls `train_demo.preview_roi()`
 
-The **Region of Interest (ROI)** crops the camera image to focus on the water surface, removing sky, vegetation, and camera housing. Defined as `(x1, y1, x2, y2)` pixel coordinates.
+The **Training Image Mode** controls what images are sent into training:
 
-- ROI **auto-fills** from the site catalog when you select a site
-- A sample image is displayed before and after cropping for visual verification
-- ROI is stored in `_state["roi"]` and passed to the training Dataset
+- **Whole image** trains on the full original images with no crop.
+- **ROI cropped image** lets you load one random sample from the active dataset image folder, select a rectangular crop, preview it, and apply the same ROI to every training image.
+- ROI coordinates use `(x1, y1, x2, y2)` format.
+- The manual coordinate fields remain available for advanced use and sync with the crop UI.
 
 **Default ROI for Pinewood Road site:** `(951, 0, 1136, 1920)`  
 → Crops to a 185px wide vertical strip across the full 1920px height
@@ -184,9 +185,17 @@ The **Region of Interest (ROI)** crops the camera image to focus on the water su
 
 **File:** `train_demo.py` → `train_model()`
 
-Configurable parameters in the UI:
+The Train tab has a **Training Configuration Mode** selector:
 
-| Parameter | Default | Description |
+- **Best configuration for training** uses the Colab-scaled EfficientNet-B3 defaults: image size 384, batch size 8, fallback batch size 4, learning rate `1e-4`, 12 epochs, and a 70/15/15 train/validation/test split.
+- **Manual setup** shows the hyperparameter controls and uses the values selected by the user.
+- Best configuration uses AdamW with `weight_decay=1e-5`, MSE loss, `ReduceLROnPlateau(mode="min", patience=2, factor=0.5)`, and early stopping patience 4.
+- The original MAIN2 EfficientNet-L2 configuration is not used by default in this Gradio app because this version targets Google Colab T4 runs with roughly 500-1000 images.
+- After training finishes, the Train tab displays both result plots: Training vs Validation Loss and Predictions vs Actuals.
+
+Manual setup parameters in the UI:
+
+| Parameter | Manual Default | Description |
 |---|---|---|
 | Number of images | 200 | How many of the downloaded images to use |
 | Epochs | 5 | Training iterations over the dataset |
@@ -212,14 +221,17 @@ Configurable parameters in the UI:
    c. Backward pass + Adam optimizer step
    d. Validation loss logged to queue → streamed to Gradio log box
    e. If val_loss improved → save best_model.pth
-6. Plot train vs val loss → training_loss_plot.png
+6. Evaluate the best checkpoint on the test split
+7. Plot train vs validation loss → training_loss_plot.png and loss_curves_<site>.png
+8. Plot predictions vs actuals → predictions_vs_actuals_<site>.png
+9. Save test actuals, predictions, and differences → test_results_<site>.csv
 ```
 
 #### Data Augmentation (training only)
 
 ```python
-ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05)
-RandomPerspective(distortion_scale=0.2, p=0.3)
+ColorJitter(brightness=(0.9, 1.2), contrast=(0.6, 1.4), saturation=(0.6, 1.4), hue=0)
+RandomPerspective(distortion_scale=0.1)
 Resize(input_img_size)
 ToTensor()
 Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ImageNet
@@ -232,7 +244,8 @@ No augmentation during validation/test (only Resize + Normalize).
 ### Step 4 – Results
 
 Displays:
-- **Loss plot** – train vs validation MSE per epoch
+- **Training vs Validation Loss** – train vs validation MSE per epoch
+- **Predictions vs Actuals** – test split predictions compared against true USGS water levels, with RMSE, MAE, and R² shown on the plot
 - **Summary text** – best epoch, best val loss, output file paths
 
 ---
@@ -302,7 +315,7 @@ Returns JSON with nested time-series at ~15-min intervals.
 ```
 Input Image (H×W×3)
        ↓
-  ROI Crop (y1:y2, x1:x2)
+  Optional ROI Crop (x1, y1, x2, y2)
        ↓
   Resize to (img_size × img_size)
        ↓
@@ -339,6 +352,7 @@ Input Image (H×W×3)
 | `build_image_label_mapping()` | Creates `{abs_path: float}` dict for the Dataset |
 | `WaterLevelDataset` | PyTorch Dataset with ROI crop + augmentation |
 | `EfficientNetRegressor` | Model class wrapping `timm` backbone + regression head |
+| `BEST_TRAINING_CONFIG` | Colab-scaled EfficientNet-B3 training configuration used by Best configuration mode |
 | `train_model()` | Full training loop with checkpointing and logging |
 | `preview_roi()` | Returns PIL images (original + cropped) for Tab 2 preview |
 | `check_gpu()` | Prints GPU/CPU status on startup |
@@ -365,9 +379,14 @@ All saved to `water_level_demo/results/`:
 | File | Description |
 |---|---|
 | `best_model.pth` | PyTorch model weights (best validation loss epoch) |
+| `best_model_<site>.pth` | Site-named copy of the best model weights |
 | `scaler.pkl` | Fitted `StandardScaler` for target inverse-transform |
+| `scaler_<site>.pkl` | Site-named copy of the fitted scaler |
 | `training_loss_plot.png` | Train vs val MSE per epoch |
+| `loss_curves_<site>.png` | Site-named train vs validation loss plot |
 | `training_history.csv` | Per-epoch loss values |
+| `test_results_<site>.csv` | Test split image paths, actuals, predictions, differences, and absolute errors |
+| `predictions_vs_actuals_<site>.png` | Test split predictions vs actuals plot with RMSE, MAE, and R² |
 | `config.json` | Training hyperparameters snapshot |
 | `split_summary.csv` | Train/val/test split statistics |
 

@@ -16,6 +16,7 @@ Key changes from production:
 """
 
 import os
+import re
 import time
 import json
 import pickle
@@ -67,6 +68,37 @@ BACKBONE_OPTIONS = {
     "efficientnet_b3 (lighter, ~48 MB)":     "tf_efficientnet_b3.ns_jft_in1k",
     "efficientnet_b0 (smallest, ~20 MB)":    "tf_efficientnet_b0.ns_jft_in1k",
 }
+
+BEST_TRAINING_CONFIG = {
+    "model_name": "efficientnet_b3",
+    "input_img_size": 384,
+    "batch_size": 8,
+    "fallback_batch_size": 4,
+    "learning_rate": 1e-4,
+    "num_epochs": 12,
+    "train_ratio": 0.7,
+    "val_ratio": 0.15,
+    "test_ratio": 0.15,
+    "random_state": 42,
+    "param_freeze_ratio": 0.65,
+    "optimizer": "AdamW",
+    "weight_decay": 1e-5,
+    "loss": "MSELoss",
+    "scheduler": "ReduceLROnPlateau",
+    "scheduler_mode": "min",
+    "scheduler_patience": 2,
+    "scheduler_factor": 0.5,
+    "early_stopping_patience": 4,
+    "num_workers": 2,
+    "pin_memory": True,
+    "backbone_name": "tf_efficientnet_b3.ns_jft_in1k",
+}
+
+BEST_TRAINING_SUMMARY = (
+    "Using Colab Best Configuration: EfficientNet-B3, image size 384, batch size 8, "
+    "learning rate 1e-4, 12 epochs, 70/15/15 split, AdamW optimizer, "
+    "ReduceLROnPlateau scheduler, early stopping patience 4."
+)
 
 # ---------------------------------------------------------------------------
 # Column auto-detection helpers  (mirrors production detect_usgs_column)
@@ -232,11 +264,13 @@ class WaterLevelDataset(Dataset):
         roi: Optional[Tuple],
         scaler: Optional[StandardScaler] = None,
         training: bool = True,
+        include_paths: bool = False,
     ):
         self.image_paths = list(mappings.keys())
         self.targets_raw = [mappings[p] for p in self.image_paths]
         self.training    = training
         self.roi         = roi           # (x1, y1, x2, y2) XYXY or None
+        self.include_paths = include_paths
 
         # ── Target scaling ────────────────────────────────────────────────
         if scaler is None:
@@ -290,6 +324,8 @@ class WaterLevelDataset(Dataset):
                 image = image[:, y1c:y2c, x1c:x2c]
 
             image = self.transforms(image)
+            if self.include_paths:
+                return image, float(target_scaled), path
             return image, float(target_scaled)
 
         except Exception:
@@ -438,6 +474,108 @@ def split_mappings(
     return _make(idx_train), _make(idx_val), _make(idx_test)
 
 
+def _slugify_site_name(site_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", site_name or "water_level").strip("_").lower()
+    return slug or "water_level"
+
+
+def _validate_training_values(
+    input_img_size: int,
+    batch_size: int,
+    learning_rate: float,
+    num_epochs: int,
+    val_ratio: float,
+    test_ratio: float,
+):
+    if input_img_size <= 0:
+        raise ValueError("Image size must be greater than 0.")
+    if batch_size <= 0:
+        raise ValueError("Batch size must be greater than 0.")
+    if learning_rate <= 0:
+        raise ValueError("Learning rate must be greater than 0.")
+    if num_epochs <= 0:
+        raise ValueError("Epochs must be greater than 0.")
+    if val_ratio <= 0:
+        raise ValueError("Validation split must be greater than 0.")
+    if test_ratio <= 0:
+        raise ValueError("Test split must be greater than 0.")
+    if val_ratio + test_ratio >= 1:
+        raise ValueError("Validation split plus test split must be less than 1.")
+
+
+def _resolve_training_config(
+    config_mode: str,
+    num_epochs: int,
+    batch_size: int,
+    input_img_size: int,
+    learning_rate: float,
+    val_ratio: float,
+    test_ratio: float,
+    param_freeze_ratio: float,
+    seed: int,
+    backbone_name: str,
+    weight_decay: float,
+    scheduler_patience: int,
+    scheduler_factor: float,
+    early_stopping_patience: Optional[int],
+    optimizer_name: str,
+    num_workers: Optional[int],
+    pin_memory: Optional[bool],
+) -> dict:
+    if config_mode == "best":
+        cfg = BEST_TRAINING_CONFIG.copy()
+        return {
+            "config_mode": "best",
+            "num_epochs": int(cfg["num_epochs"]),
+            "batch_size": int(cfg["batch_size"]),
+            "input_img_size": int(cfg["input_img_size"]),
+            "learning_rate": float(cfg["learning_rate"]),
+            "val_ratio": float(cfg["val_ratio"]),
+            "test_ratio": float(cfg["test_ratio"]),
+            "param_freeze_ratio": float(cfg["param_freeze_ratio"]),
+            "seed": int(cfg["random_state"]),
+            "backbone_name": str(cfg["backbone_name"]),
+            "optimizer_name": str(cfg["optimizer"]),
+            "weight_decay": float(cfg["weight_decay"]),
+            "scheduler_patience": int(cfg["scheduler_patience"]),
+            "scheduler_factor": float(cfg["scheduler_factor"]),
+            "early_stopping_patience": int(cfg["early_stopping_patience"]),
+            "num_workers": int(cfg["num_workers"]),
+            "pin_memory": bool(cfg["pin_memory"]),
+            "fallback_batch_size": int(cfg["fallback_batch_size"]),
+        }
+
+    resolved = {
+        "config_mode": "manual",
+        "num_epochs": int(num_epochs),
+        "batch_size": int(batch_size),
+        "input_img_size": int(input_img_size),
+        "learning_rate": float(learning_rate),
+        "val_ratio": float(val_ratio),
+        "test_ratio": float(test_ratio),
+        "param_freeze_ratio": float(param_freeze_ratio),
+        "seed": int(seed),
+        "backbone_name": backbone_name,
+        "optimizer_name": optimizer_name,
+        "weight_decay": float(weight_decay),
+        "scheduler_patience": int(scheduler_patience),
+        "scheduler_factor": float(scheduler_factor),
+        "early_stopping_patience": early_stopping_patience,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "fallback_batch_size": None,
+    }
+    _validate_training_values(
+        resolved["input_img_size"],
+        resolved["batch_size"],
+        resolved["learning_rate"],
+        resolved["num_epochs"],
+        resolved["val_ratio"],
+        resolved["test_ratio"],
+    )
+    return resolved
+
+
 # ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
@@ -456,6 +594,16 @@ def train_model(
     param_freeze_ratio: float = 0.7,
     seed: int            = 42,
     backbone_name: str   = "tf_efficientnet_b3.ns_jft_in1k",
+    config_mode: str     = "manual",
+    site_name: str       = "water_level",
+    weight_decay: float  = 1e-5,
+    scheduler_patience: int = 1,
+    scheduler_factor: float = 0.5,
+    early_stopping_patience: Optional[int] = None,
+    optimizer_name: str = "Adam",
+    num_workers: Optional[int] = None,
+    pin_memory: Optional[bool] = None,
+    allow_oom_fallback: bool = True,
     save_to_drive: bool  = False,
     drive_dir: str       = "/content/drive/MyDrive/water_level_demo",
     # Callbacks
@@ -468,6 +616,41 @@ def train_model(
     """
 
     os.makedirs(results_dir, exist_ok=True)
+    resolved_config = _resolve_training_config(
+        config_mode=config_mode,
+        num_epochs=num_epochs,
+        batch_size=batch_size,
+        input_img_size=input_img_size,
+        learning_rate=learning_rate,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+        param_freeze_ratio=param_freeze_ratio,
+        seed=seed,
+        backbone_name=backbone_name,
+        weight_decay=weight_decay,
+        scheduler_patience=scheduler_patience,
+        scheduler_factor=scheduler_factor,
+        early_stopping_patience=early_stopping_patience,
+        optimizer_name=optimizer_name,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    num_epochs = resolved_config["num_epochs"]
+    batch_size = resolved_config["batch_size"]
+    input_img_size = resolved_config["input_img_size"]
+    learning_rate = resolved_config["learning_rate"]
+    val_ratio = resolved_config["val_ratio"]
+    test_ratio = resolved_config["test_ratio"]
+    param_freeze_ratio = resolved_config["param_freeze_ratio"]
+    seed = resolved_config["seed"]
+    backbone_name = resolved_config["backbone_name"]
+    optimizer_name = resolved_config["optimizer_name"]
+    weight_decay = resolved_config["weight_decay"]
+    scheduler_patience = resolved_config["scheduler_patience"]
+    scheduler_factor = resolved_config["scheduler_factor"]
+    early_stopping_patience = resolved_config["early_stopping_patience"]
+    fallback_batch_size = resolved_config["fallback_batch_size"]
+    site_slug = _slugify_site_name(site_name)
 
     def _log(msg: str):
         print(msg)
@@ -507,29 +690,44 @@ def train_model(
     _log("\n🗃️  Building datasets …")
     train_ds = WaterLevelDataset(train_map, input_img_size, roi, scaler=None, training=True)
     val_ds   = WaterLevelDataset(val_map,   input_img_size, roi, scaler=train_ds.scaler, training=False)
-    test_ds  = WaterLevelDataset(test_map,  input_img_size, roi, scaler=train_ds.scaler, training=False)
+    test_ds  = WaterLevelDataset(
+        test_map, input_img_size, roi, scaler=train_ds.scaler,
+        training=False, include_paths=True,
+    )
 
     # Save scaler (production style: separate .pkl file)
     scaler_path = os.path.join(results_dir, "scaler.pkl")
     with open(scaler_path, "wb") as f:
         pickle.dump(train_ds.scaler, f)
+    scaler_site_path = os.path.join(results_dir, f"scaler_{site_slug}.pkl")
+    with open(scaler_site_path, "wb") as f:
+        pickle.dump(train_ds.scaler, f)
     _log(f"   Scaler saved → {scaler_path}")
 
     # Colab-safe DataLoader settings
-    num_workers = min(2, os.cpu_count() or 0)
-    pin_memory  = device.type == "cuda"
+    worker_count = (
+        min(int(resolved_config["num_workers"]), os.cpu_count() or 0)
+        if resolved_config["num_workers"] is not None
+        else min(2, os.cpu_count() or 0)
+    )
+    use_pin_memory = (
+        bool(resolved_config["pin_memory"])
+        if resolved_config["pin_memory"] is not None
+        else device.type == "cuda"
+    )
+    use_pin_memory = use_pin_memory and device.type == "cuda"
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        collate_fn=_collate_fn, num_workers=num_workers, pin_memory=pin_memory,
+        collate_fn=_collate_fn, num_workers=worker_count, pin_memory=use_pin_memory,
     )
     val_loader   = DataLoader(
         val_ds, batch_size=batch_size * 2, shuffle=False,
-        collate_fn=_collate_fn, num_workers=num_workers, pin_memory=pin_memory,
+        collate_fn=_collate_fn, num_workers=worker_count, pin_memory=use_pin_memory,
     )
     test_loader  = DataLoader(
         test_ds, batch_size=batch_size * 2, shuffle=False,
-        collate_fn=_collate_fn, num_workers=num_workers, pin_memory=pin_memory,
+        collate_fn=_collate_fn, num_workers=worker_count, pin_memory=use_pin_memory,
     )
 
     # ── Model  (Step 9 equivalent) ────────────────────────────────────────
@@ -540,9 +738,12 @@ def train_model(
         _log(f"❌ Model init failed: {e}")
         raise
 
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    optimizer_cls = optim.AdamW if optimizer_name.lower() == "adamw" else optim.Adam
+    optimizer = optimizer_cls(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     criterion = nn.MSELoss()
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=1, factor=0.5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, "min", patience=scheduler_patience, factor=scheduler_factor
+    )
     # Use the unified torch.amp API (works on PyTorch >= 1.10, avoids deprecation
     # warnings on >= 2.4).  GradScaler is a no-op when enabled=False (CPU).
     amp_scaler = torch_amp.GradScaler("cuda", enabled=use_amp)
@@ -550,7 +751,9 @@ def train_model(
     # ── Training loop  (Step 10 equivalent) ──────────────────────────────
     train_losses, val_losses = [], []
     best_val_loss  = float("inf")
+    epochs_without_improvement = 0
     best_model_path = os.path.join(results_dir, "best_model.pth")
+    best_model_site_path = os.path.join(results_dir, f"best_model_{site_slug}.pth")
     start_time      = time.time()
 
     _log(f"\n🚀 Starting training: {num_epochs} epoch(s) | batch={batch_size} | img={input_img_size}px\n")
@@ -638,16 +841,79 @@ def train_model(
                     },
                     best_model_path,
                 )
+                torch.save(
+                    {
+                        "epoch":               epoch,
+                        "model_state_dict":    model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "train_loss":          avg_train_loss,
+                        "val_loss":            avg_val_loss,
+                        "backbone":            backbone_name,
+                        "input_img_size":      input_img_size,
+                    },
+                    best_model_site_path,
+                )
                 _log(f"  ⭐ New best model saved! (val_loss={best_val_loss:.4f})")
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if (
+                    early_stopping_patience
+                    and epochs_without_improvement >= early_stopping_patience
+                ):
+                    _log(
+                        "  Early stopping triggered after "
+                        f"{early_stopping_patience} epoch(s) without improvement."
+                    )
+                    break
 
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
+            if (
+                resolved_config["config_mode"] == "best"
+                and allow_oom_fallback
+                and fallback_batch_size
+                and batch_size > fallback_batch_size
+            ):
+                _log(
+                    "❌ CUDA Out of Memory with batch size 8. "
+                    "Retrying Colab Best Configuration with batch size 4."
+                )
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                return train_model(
+                    mappings=mappings,
+                    roi=roi,
+                    results_dir=results_dir,
+                    num_epochs=num_epochs,
+                    batch_size=fallback_batch_size,
+                    input_img_size=input_img_size,
+                    learning_rate=learning_rate,
+                    val_ratio=val_ratio,
+                    test_ratio=test_ratio,
+                    param_freeze_ratio=param_freeze_ratio,
+                    seed=seed,
+                    backbone_name=backbone_name,
+                    config_mode="manual",
+                    site_name=site_name,
+                    weight_decay=weight_decay,
+                    scheduler_patience=scheduler_patience,
+                    scheduler_factor=scheduler_factor,
+                    early_stopping_patience=early_stopping_patience,
+                    optimizer_name=optimizer_name,
+                    num_workers=worker_count,
+                    pin_memory=use_pin_memory,
+                    allow_oom_fallback=False,
+                    save_to_drive=save_to_drive,
+                    drive_dir=drive_dir,
+                    log_callback=log_callback,
+                )
             msg = (
                 "❌ CUDA Out of Memory!\n"
-                "   → Reduce batch size or input image size and try again."
+                "   → Reduce batch size to 4 or lower the input image size and try again."
             )
             _log(msg)
             raise RuntimeError(msg) from e
@@ -665,14 +931,28 @@ def train_model(
     # ── Config snapshot ───────────────────────────────────────────────────
     config = {
         "backbone":          backbone_name,
+        "model_name":        BEST_TRAINING_CONFIG["model_name"] if resolved_config["config_mode"] == "best" else backbone_name,
         "num_epochs":        num_epochs,
         "batch_size":        batch_size,
         "input_img_size":    input_img_size,
         "learning_rate":     learning_rate,
         "val_ratio":         val_ratio,
         "test_ratio":        test_ratio,
+        "train_ratio":       round(1.0 - val_ratio - test_ratio, 6),
         "param_freeze_ratio": param_freeze_ratio,
         "seed":              seed,
+        "config_mode":       resolved_config["config_mode"],
+        "site_name":         site_name,
+        "optimizer":         optimizer_name,
+        "weight_decay":      weight_decay,
+        "loss":              BEST_TRAINING_CONFIG["loss"] if resolved_config["config_mode"] == "best" else "MSELoss",
+        "scheduler":         "ReduceLROnPlateau",
+        "scheduler_mode":    "min",
+        "scheduler_patience": scheduler_patience,
+        "scheduler_factor":  scheduler_factor,
+        "early_stopping_patience": early_stopping_patience,
+        "num_workers":       worker_count,
+        "pin_memory":        use_pin_memory,
         "roi":               list(roi) if roi else None,
         "n_train":           len(train_map),
         "n_val":             len(val_map),
@@ -688,6 +968,31 @@ def train_model(
 
     # ── Training loss plot ────────────────────────────────────────────────
     plot_path = plot_training_loss(train_losses, val_losses, results_dir)
+    loss_curves_site_path = plot_training_loss(
+        train_losses, val_losses, results_dir, filename=f"loss_curves_{site_slug}.png"
+    )
+
+    if os.path.exists(best_model_path):
+        checkpoint = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+    try:
+        test_results_path, predictions_plot_path, metrics_summary = evaluate_test_set(
+            model=model,
+            test_loader=test_loader,
+            scaler=train_ds.scaler,
+            device=device,
+            results_dir=results_dir,
+            site_slug=site_slug,
+            site_name=site_name,
+            use_amp=use_amp,
+        )
+        _log(f"📊 Test metrics: {metrics_summary}")
+    except Exception as e:
+        test_results_path = None
+        predictions_plot_path = None
+        metrics_summary = f"Predictions vs Actuals plot could not be generated: {e}"
+        _log(f"⚠️  {metrics_summary}")
 
     # ── Optional Google Drive copy ────────────────────────────────────────
     if save_to_drive:
@@ -695,7 +1000,11 @@ def train_model(
             import shutil
             os.makedirs(drive_dir, exist_ok=True)
             for fname in ["best_model.pth", "scaler.pkl", "training_history.csv",
-                          "training_loss_plot.png", "config.json", "split_summary.csv"]:
+                          "training_loss_plot.png", "config.json", "split_summary.csv",
+                          f"best_model_{site_slug}.pth", f"scaler_{site_slug}.pkl",
+                          f"test_results_{site_slug}.csv",
+                          f"predictions_vs_actuals_{site_slug}.png",
+                          f"loss_curves_{site_slug}.png"]:
                 src = os.path.join(results_dir, fname)
                 if os.path.exists(src):
                     shutil.copy2(src, os.path.join(drive_dir, fname))
@@ -714,10 +1023,18 @@ def train_model(
         "val_losses":     val_losses,
         "best_val_loss":  best_val_loss,
         "best_model_path": best_model_path,
+        "best_model_site_path": best_model_site_path,
         "scaler_path":    scaler_path,
+        "scaler_site_path": scaler_site_path,
         "history_path":   history_path,
         "config_path":    config_path,
         "plot_path":      plot_path,
+        "loss_plot_path": loss_curves_site_path,
+        "loss_curves_site_path": loss_curves_site_path,
+        "test_results_path": test_results_path,
+        "test_results_csv_path": test_results_path,
+        "predictions_plot_path": predictions_plot_path,
+        "metrics_summary": metrics_summary,
         "split_summary_path": split_summary_path,
         "total_time_s":   total_time,
     }
@@ -731,6 +1048,7 @@ def plot_training_loss(
     train_losses: list,
     val_losses: list,
     results_dir: str,
+    filename: str = "training_loss_plot.png",
 ) -> str:
     """
     Generate and save training/validation loss curve.
@@ -752,11 +1070,97 @@ def plot_training_loss(
     ax.set_xticks(list(epochs))
     fig.tight_layout()
 
-    plot_path = os.path.join(results_dir, "training_loss_plot.png")
+    plot_path = os.path.join(results_dir, filename)
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"📊 Loss plot saved → {plot_path}")
     return plot_path
+
+
+def evaluate_test_set(
+    model,
+    test_loader,
+    scaler: StandardScaler,
+    device,
+    results_dir: str,
+    site_slug: str,
+    site_name: str,
+    use_amp: bool,
+) -> Tuple[str, str, str]:
+    """Save MAIN2-style test predictions and predictions-vs-actuals plot."""
+    model.eval()
+    preds_scaled, targets_scaled, image_paths = [], [], []
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="  Test", leave=False):
+            if batch is None:
+                continue
+            if len(batch) == 3:
+                images, targets, paths = batch
+            else:
+                images, targets = batch
+                paths = [""] * len(targets)
+            if len(images) == 0:
+                continue
+            images = images.to(device)
+            with torch_amp.autocast("cuda", enabled=use_amp):
+                outputs = model(images).flatten().detach().cpu().numpy()
+            preds_scaled.extend(outputs.tolist())
+            targets_scaled.extend(targets.numpy().tolist())
+            image_paths.extend(list(paths))
+
+    if not preds_scaled:
+        raise ValueError(
+            "Predictions vs Actuals plot could not be generated because no valid test batches were produced."
+        )
+
+    predictions = scaler.inverse_transform(np.asarray(preds_scaled).reshape(-1, 1)).flatten()
+    actuals = scaler.inverse_transform(np.asarray(targets_scaled).reshape(-1, 1)).flatten()
+    diffs = predictions - actuals
+    rmse = float(np.sqrt(np.mean(diffs ** 2)))
+    mae = float(np.mean(np.abs(diffs)))
+    ss_res = float(np.sum((actuals - predictions) ** 2))
+    ss_tot = float(np.sum((actuals - np.mean(actuals)) ** 2))
+    r2 = float(1 - ss_res / ss_tot) if ss_tot else float("nan")
+
+    test_results_path = os.path.join(results_dir, f"test_results_{site_slug}.csv")
+    pd.DataFrame({
+        "image_path": image_paths,
+        "actual": actuals,
+        "predicted": predictions,
+        "diff": diffs,
+        "absolute_error": np.abs(diffs),
+    }).to_csv(test_results_path, index=False)
+
+    plot_path = os.path.join(results_dir, f"predictions_vs_actuals_{site_slug}.png")
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.scatter(actuals, predictions, alpha=0.5)
+    min_actual = float(np.min(actuals))
+    max_actual = float(np.max(actuals))
+    ax.plot(
+        [min_actual, max_actual],
+        [min_actual, max_actual],
+        "r--",
+        label="Perfect Prediction",
+    )
+    ax.set_xlabel("Actual Water Level")
+    ax.set_ylabel("Predicted Water Level")
+    ax.set_title(f"Predictions vs Actuals - {site_name}")
+    ax.text(
+        min_actual,
+        float(np.max(predictions)),
+        f"RMSE: {rmse:.4f}\nMAE: {mae:.4f}\nR²: {r2:.4f}",
+        fontsize=10,
+        verticalalignment="top",
+    )
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(plot_path)
+    plt.close(fig)
+
+    print(f"📄 Test results saved → {test_results_path}")
+    print(f"📊 Predictions plot saved → {plot_path}")
+    return test_results_path, plot_path, f"RMSE={rmse:.4f}, MAE={mae:.4f}, R²={r2:.4f}"
 
 
 # ---------------------------------------------------------------------------

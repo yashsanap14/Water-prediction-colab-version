@@ -730,7 +730,8 @@ def run_inference_handler(
             _open_plot(result.get("error_time_plot")),
         )
     except Exception as e:
-        return f"Inference failed: {e}", None, None, None, None, None
+        tb = traceback.format_exc()
+        return f"Inference failed: {e}\n\n--- Traceback ---\n{tb}", None, None, None, None, None
 
 
 # ---------------------------------------------------------------------------

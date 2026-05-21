@@ -23,6 +23,7 @@ from PIL import Image
 
 import train_demo as td
 import data_acquisition as da
+import inference_demo as inf
 
 # ---------------------------------------------------------------------------
 # Paths – auto-detect Colab vs local
@@ -639,6 +640,51 @@ def get_training_outputs():
 
 
 # ---------------------------------------------------------------------------
+# Tab 5 – Inference handlers
+# ---------------------------------------------------------------------------
+
+def run_inference_handler(
+    model_path,
+    scaler_path,
+    image_folder,
+    uploaded_images,
+    timestamp_file_path,
+    input_img_size,
+    batch_size,
+    use_pinewood_roi,
+    fetch_usgs_true,
+):
+    try:
+        output_dir = os.path.join(RESULTS_DIR, "inference")
+        result = inf.run_inference(
+            model_path=model_path,
+            scaler_path=scaler_path,
+            image_folder=image_folder,
+            uploaded_files=uploaded_images,
+            timestamp_file_path=timestamp_file_path,
+            input_img_size=int(input_img_size),
+            batch_size=int(batch_size),
+            use_pinewood_roi=bool(use_pinewood_roi),
+            fetch_usgs_true=bool(fetch_usgs_true),
+            output_dir=output_dir,
+        )
+
+        def _open_plot(path):
+            return Image.open(path) if path and os.path.exists(path) else None
+
+        return (
+            result["status"],
+            result["dataframe"],
+            result["csv_path"],
+            _open_plot(result.get("time_series_plot")),
+            _open_plot(result.get("scatter_plot")),
+            _open_plot(result.get("error_time_plot")),
+        )
+    except Exception as e:
+        return f"Inference failed: {e}", None, None, None, None, None
+
+
+# ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
 
@@ -651,6 +697,10 @@ body { font-family: 'Inter', sans-serif; }
 .status-box { font-family: monospace; font-size: 0.85em; }
 .log-box    { font-family: monospace; font-size: 0.82em; background: #f1f5f9;
               color: #1e293b; border-radius: 6px; padding: 8px; }
+.roi-preview img {
+    object-fit: contain !important;
+    max-height: 420px !important;
+}
 """
 
 PARAM_CHOICES = [f"{code} – {label}" for code, label in da.USGS_PARAMETERS.items()]
@@ -688,7 +738,8 @@ def launch_gradio(share: bool = True, debug: bool = False):
             # USGS Water Level Prediction – Training Demo
             ### HiVIS Image Download · USGS Sensor Data · EfficientNet Regression
             ---
-            Follow the 4 tabs in order: **Acquire Data → Set ROI → Train → Results**
+            Follow the tabs in order: **Acquire Data → Set ROI → Train → Results**.
+            Use **Inference** to test a trained model on new images.
             """
         )
 
@@ -792,6 +843,8 @@ def launch_gradio(share: bool = True, debug: bool = False):
                     label="Sample Image",
                     type="pil",
                     interactive=False,
+                    height=420,
+                    elem_classes="roi-preview",
                 )
 
                 roi_coord_text = gr.Textbox(
@@ -807,7 +860,12 @@ def launch_gradio(share: bool = True, debug: bool = False):
                     roi_y2 = gr.Number(value=1920, label="y2 (bottom)")
 
                 preview_btn = gr.Button("Preview/Apply Manual ROI")
-                cropped_img = gr.Image(label="Crop Preview", type="pil")
+                cropped_img = gr.Image(
+                    label="Crop Preview",
+                    type="pil",
+                    height=360,
+                    elem_classes="roi-preview",
+                )
                 roi_status = gr.Textbox(label="ROI Status", interactive=False)
 
             roi_mode.change(
@@ -995,6 +1053,113 @@ def launch_gradio(share: bool = True, debug: bool = False):
                 outputs=[loss_plot, predictions_plot, summary],
             )
 
+        # ===================================================================
+        # TAB 5 – Inference
+        # ===================================================================
+        with gr.Tab("5 – Inference"):
+            gr.Markdown("### Test a Trained Model",
+                        elem_classes="section-header")
+
+            with gr.Row():
+                with gr.Column():
+                    inference_model_path = gr.Textbox(
+                        label="Model .pth path",
+                        value=os.path.join(RESULTS_DIR, "best_model.pth"),
+                        placeholder="/content/water_level_demo/results/best_model.pth",
+                    )
+                    inference_scaler_path = gr.Textbox(
+                        label="Scaler .pkl path",
+                        value=os.path.join(RESULTS_DIR, "scaler.pkl"),
+                        placeholder="/content/water_level_demo/results/scaler.pkl",
+                    )
+                    inference_image_folder = gr.Textbox(
+                        label="Test image folder path",
+                        value=IMAGES_DIR,
+                        placeholder="/content/water_level_demo/data/images",
+                    )
+                    inference_uploads = gr.File(
+                        label="Or upload test images",
+                        file_count="multiple",
+                        file_types=["image"],
+                        type="filepath",
+                    )
+                    inference_timestamp_file = gr.Textbox(
+                        label="files_to_download.txt path (optional)",
+                        placeholder="/content/water_level_demo/data/files_to_download.txt",
+                    )
+                with gr.Column():
+                    inference_img_size = gr.Slider(
+                        minimum=224,
+                        maximum=800,
+                        value=600,
+                        step=32,
+                        label="Input image size (px)",
+                    )
+                    inference_batch_size = gr.Slider(
+                        minimum=1,
+                        maximum=16,
+                        value=1,
+                        step=1,
+                        label="Batch size",
+                    )
+                    inference_use_roi = gr.Checkbox(
+                        value=True,
+                        label="Use Pinewood vertical strip ROI",
+                    )
+                    inference_fetch_usgs = gr.Checkbox(
+                        value=False,
+                        label="Fetch USGS true water level",
+                    )
+
+            inference_btn = gr.Button("Run Inference", variant="primary", size="lg")
+            inference_status = gr.Textbox(
+                label="Inference Status",
+                lines=8,
+                interactive=False,
+                elem_classes="status-box",
+            )
+            inference_df = gr.Dataframe(
+                label="Prediction Preview",
+                interactive=False,
+            )
+            inference_csv = gr.File(label="Download inference_predictions.csv")
+            with gr.Row():
+                inference_timeseries_plot = gr.Image(
+                    label="Predicted vs USGS Observed Time Series",
+                    type="pil",
+                )
+                inference_scatter_plot = gr.Image(
+                    label="Predicted vs True",
+                    type="pil",
+                )
+                inference_error_plot = gr.Image(
+                    label="Absolute Error Over Time",
+                    type="pil",
+                )
+
+            inference_btn.click(
+                fn=run_inference_handler,
+                inputs=[
+                    inference_model_path,
+                    inference_scaler_path,
+                    inference_image_folder,
+                    inference_uploads,
+                    inference_timestamp_file,
+                    inference_img_size,
+                    inference_batch_size,
+                    inference_use_roi,
+                    inference_fetch_usgs,
+                ],
+                outputs=[
+                    inference_status,
+                    inference_df,
+                    inference_csv,
+                    inference_timeseries_plot,
+                    inference_scatter_plot,
+                    inference_error_plot,
+                ],
+            )
+
         # Footer
         gr.Markdown(
             """
@@ -1002,7 +1167,8 @@ def launch_gradio(share: bool = True, debug: bool = False):
             **Outputs** saved to `water_level_demo/results/`:
             `best_model.pth` · `scaler.pkl` · `training_history.csv` ·
             `training_loss_plot.png` · `config.json` · `test_results_<site>.csv` ·
-            `predictions_vs_actuals_<site>.png` · `loss_curves_<site>.png`
+            `predictions_vs_actuals_<site>.png` · `loss_curves_<site>.png` ·
+            `inference/inference_predictions.csv`
             """
         )
 

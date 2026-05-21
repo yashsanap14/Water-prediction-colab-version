@@ -475,7 +475,7 @@ app.launch_gradio(share=True)
 | **NIMS date filtering** | The `site_no` query param on the NIMS cameras endpoint does not filter — all 1,171 cameras are returned and filtered locally. |
 | **15-min matching window** | Images captured more than 15 minutes from a USGS sensor reading will not be matched and are excluded from training. |
 | **Tidal sites** | Coastal sites (Pinewood, Bailey Creek) measure `62620` (tidal elevation), not `00065` (gage height). Selecting the wrong parameter returns no data. |
-| **No inference UI** | This app is training-only. Inference (predicting from a new image) requires a separate script using `best_model.pth` + `scaler.pkl`. |
+| **Inference requires trained artifacts** | The Inference tab needs a compatible `best_model.pth`, `scaler.pkl`, and preferably the training `config.json` so it can reuse the training ROI. |
 | **NIMS API changes** | The USGS NIMS API is versioned as `v0` and may change. The verified working endpoint as of May 2026 is documented in `data_acquisition.py`. |
 
 ---

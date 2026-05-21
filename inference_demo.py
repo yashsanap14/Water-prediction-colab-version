@@ -9,6 +9,7 @@ preprocessing, ROI cropping, and model architecture stay consistent.
 
 import os
 import re
+import json
 import pickle
 from datetime import timedelta
 from typing import Iterable, Optional, Tuple
@@ -37,6 +38,48 @@ USGS_PARAMETER_CODE = "62620"
 # PIL/tensor crop format: (x1, y1, x2, y2)
 PINEWOOD_ROI = (951, 0, 1136, 1920)
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+
+
+def resolve_roi_from_training_config(
+    config_path: Optional[str],
+    fallback_roi: Optional[Tuple[int, int, int, int]],
+) -> tuple[Optional[Tuple[int, int, int, int]], str]:
+    """
+    Resolve inference ROI from a training config snapshot.
+
+    Returns (roi, message). roi=None is a valid result when training used the
+    whole image.
+    """
+    fallback = tuple(int(v) for v in fallback_roi) if fallback_roi is not None else None
+    path = os.path.expanduser(str(config_path or "").strip())
+
+    if not path or not os.path.exists(path):
+        return fallback, f"Training config not found; using site catalog ROI: {fallback or 'whole image'}."
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as e:
+        return fallback, f"Training config could not be read ({e}); using site catalog ROI: {fallback or 'whole image'}."
+
+    if "roi" not in config:
+        return fallback, f"Training config has no ROI field; using site catalog ROI: {fallback or 'whole image'}."
+
+    roi = config.get("roi")
+    if roi is None:
+        return None, "Training config ROI is null; using whole image to match training."
+
+    try:
+        if len(roi) != 4:
+            raise ValueError("ROI must contain four values")
+        resolved = tuple(int(v) for v in roi)
+        x1, y1, x2, y2 = resolved
+        if x1 >= x2 or y1 >= y2:
+            raise ValueError("ROI must satisfy x1 < x2 and y1 < y2")
+    except Exception as e:
+        return fallback, f"Training config ROI is invalid ({e}); using site catalog ROI: {fallback or 'whole image'}."
+
+    return resolved, f"Using ROI from training config: {resolved}."
 
 
 def _uploaded_file_path(uploaded_file) -> Optional[str]:
@@ -326,6 +369,185 @@ def _plot_outputs(df: pd.DataFrame, output_dir: str) -> dict[str, Optional[str]]
     plt.close(fig)
     paths["error_time"] = error_path
     return paths
+
+
+def _image_paths_from_labels(df: pd.DataFrame, image_dir: str) -> tuple[str, list[str]]:
+    img_col, _, _ = td.detect_columns(df)
+    paths = []
+    for value in df[img_col]:
+        raw_path = str(value).strip()
+        candidates = [
+            raw_path,
+            os.path.join(image_dir, raw_path),
+            os.path.join(image_dir, os.path.basename(raw_path)),
+        ]
+        resolved = None
+        for candidate in candidates:
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                resolved = os.path.abspath(candidate)
+                break
+        paths.append(resolved or raw_path)
+    return img_col, paths
+
+
+def _timestamp_series(df: pd.DataFrame) -> pd.Series:
+    for column in ("timestamp", "dt_image", "datetime", "dt_pdatetime", "date_time"):
+        if column in df.columns:
+            return pd.to_datetime(df[column], errors="coerce")
+    return pd.Series([pd.NaT] * len(df), index=df.index)
+
+
+def run_inference_from_labels(
+    labels_csv_path: str,
+    model_path: str,
+    scaler_path: str,
+    site_name: str,
+    site_info: dict,
+    roi: Optional[Tuple[int, int, int, int]],
+    input_img_size: int = 384,
+    batch_size: int = 1,
+    output_dir: str = "water_level_demo/results/inference",
+) -> dict:
+    """Run inference from a USGS acquisition labels CSV."""
+    os.makedirs(output_dir, exist_ok=True)
+    labels_path = os.path.expanduser(str(labels_csv_path).strip())
+    if not labels_path or not os.path.exists(labels_path):
+        raise ValueError(f"Labels CSV not found: {labels_csv_path}")
+
+    df = pd.read_csv(labels_path)
+    image_dir = os.path.join(os.path.dirname(labels_path), "images")
+    img_col, image_paths = _image_paths_from_labels(df, image_dir)
+    missing = [p for p in image_paths if not os.path.exists(p)]
+    if missing:
+        raise ValueError(
+            "Some images referenced by the labels CSV are missing. "
+            f"First missing image: {missing[0]}"
+        )
+
+    scaler = load_scaler(scaler_path)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model, backbone, checkpoint_img_size = load_model(model_path, device)
+
+    mappings = {path: 0.0 for path in image_paths}
+    ds = td.WaterLevelDataset(
+        mappings,
+        input_img_size=int(input_img_size),
+        roi=roi,
+        scaler=scaler,
+        training=False,
+        include_paths=True,
+    )
+    dl = DataLoader(
+        ds,
+        batch_size=int(batch_size),
+        shuffle=False,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=td._collate_fn,
+    )
+
+    predictions_by_path: dict[str, float] = {}
+    with torch.no_grad():
+        for batch in dl:
+            if batch is None:
+                continue
+            images, _, paths = batch
+            if len(images) == 0:
+                continue
+            outputs = model(images.float().to(device)).flatten().detach().cpu().numpy()
+            values = ds.reverse_scale(outputs)
+            predictions_by_path.update(
+                {path: float(value) for path, value in zip(paths, values)}
+            )
+
+    if not predictions_by_path:
+        raise ValueError("No valid inference batches were produced. Check that the downloaded images can be opened.")
+
+    out_df = df.copy()
+    out_df["dfile_path"] = image_paths
+    out_df["dthivis_image"] = [os.path.basename(path) for path in image_paths]
+    out_df["site_id"] = site_info.get("site_no", site_info.get("nwisId", ""))
+    out_df["site_name"] = site_name
+    out_df["hiviscam_id"] = site_info.get("camId") or ""
+    out_df["mlpredicted_wl_model1"] = [
+        predictions_by_path.get(path, np.nan) for path in image_paths
+    ]
+
+    if "water_level" in out_df.columns:
+        out_df["usgstrue_wl"] = pd.to_numeric(out_df["water_level"], errors="coerce")
+    elif "usgstrue_wl" not in out_df.columns:
+        out_df["usgstrue_wl"] = np.nan
+
+    out_df["dt_abs_error_model1"] = (
+        out_df["mlpredicted_wl_model1"] - out_df["usgstrue_wl"]
+    ).abs()
+
+    timestamps = _timestamp_series(out_df)
+    out_df["dt_pdatetime"] = timestamps.dt.strftime("%Y-%m-%d %H:%M:%S")
+    out_df["dt_tdatetime"] = out_df["dt_pdatetime"]
+
+    crop_cols = _crop_corner_columns(roi)
+    for col, value in crop_cols.items():
+        out_df[col] = value
+
+    overlay_base = ""
+    if site_info.get("camId"):
+        overlay_base = f"https://usgs-nims-images.s3.amazonaws.com/overlay/{site_info['camId']}/"
+    out_df["hivis_weblink"] = [
+        overlay_base + os.path.basename(path) if overlay_base else ""
+        for path in image_paths
+    ]
+    out_df["model_path"] = os.path.abspath(os.path.expanduser(str(model_path).strip()))
+    out_df["scaler_path"] = os.path.abspath(os.path.expanduser(str(scaler_path).strip()))
+    out_df["inference_roi"] = str(roi or "whole image")
+
+    leading_cols = [
+        "site_id",
+        "site_name",
+        "hiviscam_id",
+        "dthivis_image",
+        "dfile_path",
+        "hivis_weblink",
+        "mlpredicted_wl_model1",
+        "dt_abs_error_model1",
+        "usgstrue_wl",
+        "dt_pdatetime",
+        "dt_tdatetime",
+        "cropped_coords_tl",
+        "cropped_coords_tr",
+        "cropped_coords_br",
+        "cropped_coords_bl",
+    ]
+    ordered = leading_cols + [c for c in out_df.columns if c not in leading_cols]
+    out_df = out_df[ordered]
+
+    csv_path = os.path.join(output_dir, "inference_predictions.csv")
+    out_df.to_csv(csv_path, index=False)
+    plot_paths = _plot_outputs(out_df, output_dir) if out_df["usgstrue_wl"].notna().any() else {
+        "time_series": None,
+        "scatter": None,
+        "error_time": None,
+    }
+
+    status = (
+        f"Inference complete for {len(out_df)} image(s).\n"
+        f"Site: {site_name}\n"
+        f"Device: {device}\n"
+        f"Backbone: {backbone}\n"
+        f"Checkpoint image size: {checkpoint_img_size or 'not stored'}\n"
+        f"Requested image size: {int(input_img_size)}\n"
+        f"ROI: {roi or 'whole image'}\n"
+        f"Labels CSV: {labels_path}\n"
+        f"Output CSV: {csv_path}"
+    )
+    return {
+        "status": status,
+        "dataframe": out_df,
+        "csv_path": csv_path,
+        "time_series_plot": plot_paths["time_series"],
+        "scatter_plot": plot_paths["scatter"],
+        "error_time_plot": plot_paths["error_time"],
+        "image_column": img_col,
+    }
 
 
 def run_inference(

@@ -577,6 +577,20 @@ def _resolve_training_config(
     return resolved
 
 
+def _format_progress_bar(step: int, total: int, width: int = 24) -> str:
+    total = max(int(total), 1)
+    step = min(max(int(step), 0), total)
+    filled = int(round(width * step / total))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _should_log_progress(step: int, total: int) -> bool:
+    if total <= 0:
+        return False
+    interval = max(1, total // 10)
+    return step == 1 or step == total or step % interval == 0
+
+
 # ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
@@ -657,6 +671,16 @@ def train_model(
         print(msg)
         if log_callback is not None:
             log_callback(msg)
+
+    def _log_progress(phase: str, epoch_num: int, step: int, total: int, loss_value=None):
+        if not _should_log_progress(step, total):
+            return
+        pct = 100.0 * min(max(step, 0), max(total, 1)) / max(total, 1)
+        suffix = f" | loss={loss_value:.4f}" if loss_value is not None else ""
+        _log(
+            f"  {phase} progress {epoch_num}/{num_epochs}: "
+            f"{_format_progress_bar(step, total)} {pct:5.1f}% ({step}/{total}){suffix}"
+        )
 
     # ── Device ────────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -769,12 +793,18 @@ def train_model(
             # ── Train phase ──
             model.train()
             total_train_loss, batch_count = 0.0, 0
+            train_total_batches = len(train_loader)
 
-            for batch in tqdm(train_loader, desc=f"  Train epoch {epoch+1}", leave=False):
+            for step, batch in enumerate(
+                tqdm(train_loader, desc=f"  Train epoch {epoch+1}", leave=False),
+                start=1,
+            ):
                 if batch is None:
+                    _log_progress("Train", epoch + 1, step, train_total_batches)
                     continue
                 images, targets = batch
                 if len(images) == 0:
+                    _log_progress("Train", epoch + 1, step, train_total_batches)
                     continue
 
                 images  = images.to(device)
@@ -791,6 +821,7 @@ def train_model(
 
                 total_train_loss += loss.item()
                 batch_count      += 1
+                _log_progress("Train", epoch + 1, step, train_total_batches, loss.item())
 
             avg_train_loss = total_train_loss / max(batch_count, 1)
             train_losses.append(avg_train_loss)
@@ -798,13 +829,19 @@ def train_model(
             # ── Val phase ──
             model.eval()
             total_val_loss, val_batch_count = 0.0, 0
+            val_total_batches = len(val_loader)
 
             with torch.no_grad():
-                for batch in tqdm(val_loader, desc="  Validation", leave=False):
+                for step, batch in enumerate(
+                    tqdm(val_loader, desc="  Validation", leave=False),
+                    start=1,
+                ):
                     if batch is None:
+                        _log_progress("Validation", epoch + 1, step, val_total_batches)
                         continue
                     images, targets = batch
                     if len(images) == 0:
+                        _log_progress("Validation", epoch + 1, step, val_total_batches)
                         continue
                     images  = images.to(device)
                     targets = targets.to(device).float()
@@ -813,6 +850,7 @@ def train_model(
                         loss    = criterion(outputs, targets)
                     total_val_loss   += loss.item()
                     val_batch_count  += 1
+                    _log_progress("Validation", epoch + 1, step, val_total_batches, loss.item())
 
             avg_val_loss = total_val_loss / max(val_batch_count, 1)
             val_losses.append(avg_val_loss)

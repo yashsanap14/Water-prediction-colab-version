@@ -39,9 +39,10 @@ else:
 DATA_DIR    = os.path.join(BASE_DIR, "data")
 IMAGES_DIR  = os.path.join(DATA_DIR, "images")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
+INFERENCE_DATA_DIR = os.path.join(BASE_DIR, "inference", "data")
 DRIVE_DIR   = "/content/drive/MyDrive/water_level_demo/results"
 
-for d in [BASE_DIR, DATA_DIR, IMAGES_DIR, RESULTS_DIR]:
+for d in [BASE_DIR, DATA_DIR, IMAGES_DIR, RESULTS_DIR, INFERENCE_DATA_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -646,34 +647,82 @@ def get_training_outputs():
 def run_inference_handler(
     model_path,
     scaler_path,
-    image_folder,
-    uploaded_images,
-    timestamp_file_path,
+    config_path,
+    site_name,
+    start_date,
+    end_date,
+    max_images,
+    param_selection,
+    api_key,
     input_img_size,
     batch_size,
-    use_pinewood_roi,
-    fetch_usgs_true,
 ):
     try:
+        if not site_name:
+            return "Inference failed: Please select a USGS site.", None, None, None, None, None
+
+        code_map = {f"{code} – {label}": code
+                    for code, label in da.USGS_PARAMETERS.items()}
+        param_codes = [code_map[s] for s in (param_selection or []) if s in code_map]
+        if not param_codes:
+            return "Inference failed: Please select at least one USGS parameter.", None, None, None, None, None
+        if not any(code in da.WATER_LEVEL_TARGET_CODES for code in param_codes):
+            targets = ", ".join(da.WATER_LEVEL_TARGET_CODES)
+            return (
+                "Inference failed: Select at least one water-level parameter "
+                f"({targets}) so predictions can be matched against USGS values.",
+                None, None, None, None, None,
+            )
+
+        log_lines = []
+
+        def _log(msg):
+            log_lines.append(str(msg))
+
+        csv_path, matched, _ = da.run_acquisition(
+            site_name=site_name,
+            start_date=start_date,
+            end_date=end_date,
+            max_images=int(max_images),
+            param_codes=param_codes,
+            dest_dir=INFERENCE_DATA_DIR,
+            api_key=api_key.strip() if api_key else None,
+            log_cb=_log,
+        )
+
+        site_info = da.SITE_CATALOG[site_name]
+        roi, roi_message = inf.resolve_roi_from_training_config(
+            config_path,
+            site_info.get("roi"),
+        )
+
         output_dir = os.path.join(RESULTS_DIR, "inference")
-        result = inf.run_inference(
-            model_path=model_path,
-            scaler_path=scaler_path,
-            image_folder=image_folder,
-            uploaded_files=uploaded_images,
-            timestamp_file_path=timestamp_file_path,
+        result = inf.run_inference_from_labels(
+            labels_csv_path=csv_path,
             input_img_size=int(input_img_size),
             batch_size=int(batch_size),
-            use_pinewood_roi=bool(use_pinewood_roi),
-            fetch_usgs_true=bool(fetch_usgs_true),
+            model_path=model_path,
+            scaler_path=scaler_path,
+            site_name=site_name,
+            site_info=site_info,
+            roi=roi,
             output_dir=output_dir,
         )
 
         def _open_plot(path):
             return Image.open(path) if path and os.path.exists(path) else None
 
+        status = (
+            "\n".join(log_lines)
+            + "\n\n"
+            + f"Matched inference samples: {matched}\n"
+            + roi_message
+            + "\n\n"
+            + result["status"]
+        )
+
         return (
-            result["status"],
+            status,
             result["dataframe"],
             result["csv_path"],
             _open_plot(result.get("time_series_plot")),
@@ -1057,10 +1106,41 @@ def launch_gradio(share: bool = True, debug: bool = False):
         # TAB 5 – Inference
         # ===================================================================
         with gr.Tab("5 – Inference"):
-            gr.Markdown("### Test a Trained Model",
+            gr.Markdown("### Download USGS Images and Run Inference",
                         elem_classes="section-header")
 
             with gr.Row():
+                with gr.Column():
+                    inference_site_dd = gr.Dropdown(
+                        choices=SITE_CHOICES,
+                        label="USGS Site",
+                        value=SITE_CHOICES[0],
+                    )
+                    with gr.Row():
+                        inference_start_date = gr.Textbox(
+                            label="Start Date (YYYY-MM-DD)",
+                            value="2025-01-01",
+                            placeholder="2025-01-01",
+                        )
+                        inference_end_date = gr.Textbox(
+                            label="End Date (YYYY-MM-DD)",
+                            value="2025-03-31",
+                            placeholder="2025-03-31",
+                        )
+                    inference_max_images = gr.Slider(
+                        minimum=10, maximum=500, value=100, step=10,
+                        label="Max images to download for inference",
+                    )
+                    inference_param_checks = gr.CheckboxGroup(
+                        choices=PARAM_CHOICES,
+                        value=_default_param_selection(SITE_CHOICES[0]),
+                        label="USGS Parameters to fetch and include in CSV",
+                    )
+                    inference_api_key = gr.Textbox(
+                        label="NIMS API Key (optional – leave blank to try without)",
+                        placeholder="Paste your api.waterdata.usgs.gov key here",
+                        type="password",
+                    )
                 with gr.Column():
                     inference_model_path = gr.Textbox(
                         label="Model .pth path",
@@ -1072,26 +1152,15 @@ def launch_gradio(share: bool = True, debug: bool = False):
                         value=os.path.join(RESULTS_DIR, "scaler.pkl"),
                         placeholder="/content/water_level_demo/results/scaler.pkl",
                     )
-                    inference_image_folder = gr.Textbox(
-                        label="Test image folder path",
-                        value=IMAGES_DIR,
-                        placeholder="/content/water_level_demo/data/images",
+                    inference_config_path = gr.Textbox(
+                        label="Training config.json path",
+                        value=os.path.join(RESULTS_DIR, "config.json"),
+                        placeholder="/content/water_level_demo/results/config.json",
                     )
-                    inference_uploads = gr.File(
-                        label="Or upload test images",
-                        file_count="multiple",
-                        file_types=["image"],
-                        type="filepath",
-                    )
-                    inference_timestamp_file = gr.Textbox(
-                        label="files_to_download.txt path (optional)",
-                        placeholder="/content/water_level_demo/data/files_to_download.txt",
-                    )
-                with gr.Column():
                     inference_img_size = gr.Slider(
                         minimum=224,
                         maximum=800,
-                        value=600,
+                        value=384,
                         step=32,
                         label="Input image size (px)",
                     )
@@ -1102,19 +1171,17 @@ def launch_gradio(share: bool = True, debug: bool = False):
                         step=1,
                         label="Batch size",
                     )
-                    inference_use_roi = gr.Checkbox(
-                        value=True,
-                        label="Use Pinewood vertical strip ROI",
-                    )
-                    inference_fetch_usgs = gr.Checkbox(
-                        value=False,
-                        label="Fetch USGS true water level",
-                    )
+
+            inference_site_dd.change(
+                fn=_default_param_selection,
+                inputs=inference_site_dd,
+                outputs=inference_param_checks,
+            )
 
             inference_btn = gr.Button("Run Inference", variant="primary", size="lg")
             inference_status = gr.Textbox(
                 label="Inference Status",
-                lines=8,
+                lines=16,
                 interactive=False,
                 elem_classes="status-box",
             )
@@ -1142,13 +1209,15 @@ def launch_gradio(share: bool = True, debug: bool = False):
                 inputs=[
                     inference_model_path,
                     inference_scaler_path,
-                    inference_image_folder,
-                    inference_uploads,
-                    inference_timestamp_file,
+                    inference_config_path,
+                    inference_site_dd,
+                    inference_start_date,
+                    inference_end_date,
+                    inference_max_images,
+                    inference_param_checks,
+                    inference_api_key,
                     inference_img_size,
                     inference_batch_size,
-                    inference_use_roi,
-                    inference_fetch_usgs,
                 ],
                 outputs=[
                     inference_status,

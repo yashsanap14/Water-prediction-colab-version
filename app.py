@@ -644,6 +644,46 @@ def get_training_outputs():
 # Tab 5 – Inference handlers
 # ---------------------------------------------------------------------------
 
+def _format_inference_error(error, step, log_lines):
+    text = str(error)
+    lower = text.lower()
+    suggestions = []
+
+    if "model file not found" in lower:
+        suggestions.append("Run training first, or set Model .pth path to an existing best_model.pth file.")
+    if "scaler file not found" in lower:
+        suggestions.append("Run training first, or set Scaler .pkl path to the scaler.pkl saved with this model.")
+    if "no hivis camera found" in lower:
+        suggestions.append("Choose a site with an available USGS HiVIS camera.")
+    if "no images found" in lower or "no images downloaded" in lower:
+        suggestions.append("Try a wider date range or a different site; there may be no HiVIS images for that period.")
+    if "no usable water-level target" in lower or "water-level parameter" in lower:
+        suggestions.append("Select at least one water-level parameter, usually 62620 for tidal sites or 00065 for gage-height sites.")
+    if "no images matched" in lower or "within 15 minutes" in lower:
+        suggestions.append("The downloaded image times did not align with USGS readings. Try a different date range or parameter.")
+    if "some images referenced" in lower:
+        suggestions.append("The labels CSV points to missing images. Re-run inference download for the same site/date range.")
+    if "no valid inference batches" in lower:
+        suggestions.append("Check that downloaded images are valid JPG/PNG files and that the ROI is inside the image bounds.")
+    if "size mismatch" in lower or "shape mismatch" in lower:
+        suggestions.append("The selected model and scaler/config may not belong to the same training run.")
+    if "could not resolve host" in lower or "connection" in lower or "timeout" in lower:
+        suggestions.append("Check network access to USGS/GitHub resources and try again.")
+
+    if not suggestions:
+        suggestions.append("Check the selected site, date range, parameters, model path, scaler path, and config path.")
+
+    completed_log = "\n".join(log_lines).strip()
+    log_block = f"\n\nCompleted log before failure:\n{completed_log}" if completed_log else ""
+    suggestion_block = "\n".join(f"- {s}" for s in dict.fromkeys(suggestions))
+
+    return (
+        f"Inference stopped during: {step}\n\n"
+        f"Reason:\n{text}\n\n"
+        f"What to try:\n{suggestion_block}"
+        f"{log_block}"
+    )
+
 def run_inference_handler(
     model_path,
     scaler_path,
@@ -657,6 +697,8 @@ def run_inference_handler(
     input_img_size,
     batch_size,
 ):
+    log_lines = []
+    current_step = "validating inputs"
     try:
         if not site_name:
             return "Inference failed: Please select a USGS site.", None, None, None, None, None
@@ -674,11 +716,10 @@ def run_inference_handler(
                 None, None, None, None, None,
             )
 
-        log_lines = []
-
         def _log(msg):
             log_lines.append(str(msg))
 
+        current_step = "downloading HiVIS images and matching USGS parameters"
         csv_path, matched, _ = da.run_acquisition(
             site_name=site_name,
             start_date=start_date,
@@ -691,12 +732,14 @@ def run_inference_handler(
         )
 
         site_info = da.SITE_CATALOG[site_name]
+        current_step = "resolving the training ROI from config.json"
         roi, roi_message = inf.resolve_roi_from_training_config(
             config_path,
             site_info.get("roi"),
         )
 
         output_dir = os.path.join(RESULTS_DIR, "inference")
+        current_step = "loading model/scaler and running predictions"
         result = inf.run_inference_from_labels(
             labels_csv_path=csv_path,
             input_img_size=int(input_img_size),
@@ -730,8 +773,8 @@ def run_inference_handler(
             _open_plot(result.get("error_time_plot")),
         )
     except Exception as e:
-        tb = traceback.format_exc()
-        return f"Inference failed: {e}\n\n--- Traceback ---\n{tb}", None, None, None, None, None
+        print(traceback.format_exc())
+        return _format_inference_error(e, current_step, log_lines), None, None, None, None, None
 
 
 # ---------------------------------------------------------------------------

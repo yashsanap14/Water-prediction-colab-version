@@ -40,6 +40,7 @@ DATA_DIR    = os.path.join(BASE_DIR, "data")
 IMAGES_DIR  = os.path.join(DATA_DIR, "images")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 INFERENCE_DATA_DIR = os.path.join(BASE_DIR, "inference", "data")
+INFERENCE_ERROR_LOG_PATH = os.path.join(RESULTS_DIR, "inference_error_log.txt")
 DRIVE_DIR   = "/content/drive/MyDrive/water_level_demo/results"
 
 for d in [BASE_DIR, DATA_DIR, IMAGES_DIR, RESULTS_DIR, INFERENCE_DATA_DIR]:
@@ -684,6 +685,15 @@ def _format_inference_error(error, step, log_lines):
         f"{log_block}"
     )
 
+
+def _format_inference_traceback_error(error, step, log_lines, tb, log_path):
+    return (
+        _format_inference_error(error, step, log_lines)
+        + "\n\nFull Python traceback:\n"
+        + tb
+        + f"\nFull traceback saved to:\n{log_path}"
+    )
+
 def run_inference_handler(
     model_path,
     scaler_path,
@@ -750,6 +760,7 @@ def run_inference_handler(
             site_info=site_info,
             roi=roi,
             output_dir=output_dir,
+            log_callback=_log,
         )
 
         def _open_plot(path):
@@ -773,8 +784,17 @@ def run_inference_handler(
             _open_plot(result.get("error_time_plot")),
         )
     except Exception as e:
-        print(traceback.format_exc())
-        return _format_inference_error(e, current_step, log_lines), None, None, None, None, None
+        tb = traceback.format_exc()
+        print(tb, flush=True)
+        log_path = inf.save_error_traceback(tb, INFERENCE_ERROR_LOG_PATH)
+        return (
+            _format_inference_traceback_error(e, current_step, log_lines, tb, log_path),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -813,7 +833,7 @@ def _default_param_selection(site_name):
     return _param_labels_for_codes(site_info.get("default_params", []))
 
 
-def launch_gradio(share: bool = True, debug: bool = False):
+def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = True):
     """Build and launch the Gradio app."""
 
     with gr.Blocks(
@@ -1288,6 +1308,7 @@ def launch_gradio(share: bool = True, debug: bool = False):
     demo.launch(
         share=share,
         debug=debug,
+        show_error=show_error,
     )
     return demo
 

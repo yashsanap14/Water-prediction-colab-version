@@ -11,8 +11,10 @@ import os
 import re
 import json
 import pickle
+import argparse
+import traceback
 from datetime import timedelta
-from typing import Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -38,6 +40,36 @@ USGS_PARAMETER_CODE = "62620"
 # PIL/tensor crop format: (x1, y1, x2, y2)
 PINEWOOD_ROI = (951, 0, 1136, 1920)
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+
+if os.path.exists("/content"):
+    DEFAULT_BASE_DIR = os.environ.get("WATER_LEVEL_DEMO_BASE_DIR", "/content/water_level_demo")
+else:
+    DEFAULT_BASE_DIR = os.environ.get(
+        "WATER_LEVEL_DEMO_BASE_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "water_level_demo"),
+    )
+
+DEFAULT_RESULTS_DIR = os.path.join(DEFAULT_BASE_DIR, "results")
+DEFAULT_INFERENCE_OUTPUT_DIR = os.path.join(DEFAULT_RESULTS_DIR, "inference")
+DEFAULT_ERROR_LOG_PATH = os.path.join(DEFAULT_RESULTS_DIR, "inference_error_log.txt")
+
+
+def _log_step(log_callback: Optional[Callable[[str], None]], message: str) -> None:
+    line = f"[inference] {message}"
+    print(line, flush=True)
+    if log_callback is not None:
+        log_callback(line)
+
+
+def save_error_traceback(traceback_text: str, error_log_path: str = DEFAULT_ERROR_LOG_PATH) -> str:
+    """Persist a full inference traceback and return the written path."""
+    path = os.path.expanduser(str(error_log_path).strip())
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(traceback_text)
+        if not traceback_text.endswith("\n"):
+            f.write("\n")
+    return path
 
 
 def resolve_roi_from_training_config(
@@ -406,17 +438,21 @@ def run_inference_from_labels(
     roi: Optional[Tuple[int, int, int, int]],
     input_img_size: int = 384,
     batch_size: int = 1,
-    output_dir: str = "water_level_demo/results/inference",
+    output_dir: str = DEFAULT_INFERENCE_OUTPUT_DIR,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Run inference from a USGS acquisition labels CSV."""
     os.makedirs(output_dir, exist_ok=True)
     labels_path = os.path.expanduser(str(labels_csv_path).strip())
+    _log_step(log_callback, f"Checking CSV path: {labels_path}")
     if not labels_path or not os.path.exists(labels_path):
         raise ValueError(f"Labels CSV not found: {labels_csv_path}")
 
+    _log_step(log_callback, "Reading labels CSV")
     df = pd.read_csv(labels_path)
     image_dir = os.path.join(os.path.dirname(labels_path), "images")
     img_col, image_paths = _image_paths_from_labels(df, image_dir)
+    _log_step(log_callback, f"Checking image paths from CSV: {len(image_paths)} image(s)")
     missing = [p for p in image_paths if not os.path.exists(p)]
     if missing:
         raise ValueError(
@@ -424,10 +460,23 @@ def run_inference_from_labels(
             f"First missing image: {missing[0]}"
         )
 
+    model_check_path = os.path.expanduser(str(model_path).strip())
+    _log_step(log_callback, f"Checking model path: {model_check_path}")
+    if not model_check_path or not os.path.exists(model_check_path):
+        raise ValueError(f"Model file not found: {model_path}")
+
+    scaler_check_path = os.path.expanduser(str(scaler_path).strip())
+    _log_step(log_callback, f"Checking scaler path: {scaler_check_path}")
+    if not scaler_check_path or not os.path.exists(scaler_check_path):
+        raise ValueError(f"Scaler file not found: {scaler_path}")
+
+    _log_step(log_callback, "Loading scaler")
     scaler = load_scaler(scaler_path)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    _log_step(log_callback, f"Loading model on device: {device}")
     model, backbone, checkpoint_img_size = load_model(model_path, device)
 
+    _log_step(log_callback, "Preparing dataset")
     mappings = {path: 0.0 for path in image_paths}
     ds = td.WaterLevelDataset(
         mappings,
@@ -437,6 +486,7 @@ def run_inference_from_labels(
         training=False,
         include_paths=True,
     )
+    _log_step(log_callback, "Creating DataLoader")
     dl = DataLoader(
         ds,
         batch_size=int(batch_size),
@@ -446,6 +496,8 @@ def run_inference_from_labels(
     )
 
     predictions_by_path: dict[str, float] = {}
+    _log_step(log_callback, "Running predictions")
+    logged_inverse_scale = False
     with torch.no_grad():
         for batch in dl:
             if batch is None:
@@ -454,6 +506,9 @@ def run_inference_from_labels(
             if len(images) == 0:
                 continue
             outputs = model(images.float().to(device)).flatten().detach().cpu().numpy()
+            if not logged_inverse_scale:
+                _log_step(log_callback, "Inverse-scaling predictions")
+                logged_inverse_scale = True
             values = ds.reverse_scale(outputs)
             predictions_by_path.update(
                 {path: float(value) for path, value in zip(paths, values)}
@@ -521,7 +576,9 @@ def run_inference_from_labels(
     out_df = out_df[ordered]
 
     csv_path = os.path.join(output_dir, "inference_predictions.csv")
+    _log_step(log_callback, f"Saving predictions CSV: {csv_path}")
     out_df.to_csv(csv_path, index=False)
+    _log_step(log_callback, "Generating plots")
     plot_paths = _plot_outputs(out_df, output_dir) if out_df["usgstrue_wl"].notna().any() else {
         "time_series": None,
         "scatter": None,
@@ -539,6 +596,7 @@ def run_inference_from_labels(
         f"Labels CSV: {labels_path}\n"
         f"Output CSV: {csv_path}"
     )
+    _log_step(log_callback, "Finishing inference")
     return {
         "status": status,
         "dataframe": out_df,
@@ -560,17 +618,38 @@ def run_inference(
     batch_size: int = 1,
     use_pinewood_roi: bool = True,
     fetch_usgs_true: bool = False,
-    output_dir: str = "water_level_demo/results/inference",
+    output_dir: str = DEFAULT_INFERENCE_OUTPUT_DIR,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Run model inference and save CSV/plot outputs."""
     os.makedirs(output_dir, exist_ok=True)
 
+    _log_step(log_callback, f"Checking image path input: {image_folder or 'uploaded files'}")
     image_paths = collect_image_files(image_folder, uploaded_files)
+    _log_step(log_callback, f"Checking resolved image paths: {len(image_paths)} image(s)")
+
+    model_check_path = os.path.expanduser(str(model_path).strip())
+    _log_step(log_callback, f"Checking model path: {model_check_path}")
+    if not model_check_path or not os.path.exists(model_check_path):
+        raise ValueError(f"Model file not found: {model_path}")
+
+    scaler_check_path = os.path.expanduser(str(scaler_path).strip())
+    _log_step(log_callback, f"Checking scaler path: {scaler_check_path}")
+    if not scaler_check_path or not os.path.exists(scaler_check_path):
+        raise ValueError(f"Scaler file not found: {scaler_path}")
+
+    if timestamp_file_path:
+        timestamp_check_path = os.path.expanduser(str(timestamp_file_path).strip())
+        _log_step(log_callback, f"Checking CSV/timestamp path if used: {timestamp_check_path}")
+
+    _log_step(log_callback, "Loading scaler")
     scaler = load_scaler(scaler_path)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    _log_step(log_callback, f"Loading model on device: {device}")
     model, backbone, checkpoint_img_size = load_model(model_path, device)
 
     roi = PINEWOOD_ROI if use_pinewood_roi else None
+    _log_step(log_callback, "Preparing dataset")
     mappings = {path: 0.0 for path in image_paths}
     ds = td.WaterLevelDataset(
         mappings,
@@ -580,6 +659,7 @@ def run_inference(
         training=False,
         include_paths=True,
     )
+    _log_step(log_callback, "Creating DataLoader")
     dl = DataLoader(
         ds,
         batch_size=int(batch_size),
@@ -589,6 +669,8 @@ def run_inference(
     )
 
     predictions: list[tuple[str, float]] = []
+    _log_step(log_callback, "Running predictions")
+    logged_inverse_scale = False
     with torch.no_grad():
         for batch in dl:
             if batch is None:
@@ -597,6 +679,9 @@ def run_inference(
             if len(images) == 0:
                 continue
             outputs = model(images.float().to(device)).flatten().detach().cpu().numpy()
+            if not logged_inverse_scale:
+                _log_step(log_callback, "Inverse-scaling predictions")
+                logged_inverse_scale = True
             values = ds.reverse_scale(outputs)
             predictions.extend((path, float(value)) for path, value in zip(paths, values))
 
@@ -650,7 +735,9 @@ def run_inference(
     ])
 
     csv_path = os.path.join(output_dir, "inference_predictions.csv")
+    _log_step(log_callback, f"Saving predictions CSV: {csv_path}")
     df.to_csv(csv_path, index=False)
+    _log_step(log_callback, "Generating plots")
     plot_paths = _plot_outputs(df, output_dir) if df["usgstrue_wl"].notna().any() else {
         "time_series": None,
         "scatter": None,
@@ -667,6 +754,7 @@ def run_inference(
         f"{usgs_message}\n"
         f"CSV saved: {csv_path}"
     )
+    _log_step(log_callback, "Finishing inference")
     return {
         "status": status,
         "dataframe": df,
@@ -675,3 +763,98 @@ def run_inference(
         "scatter_plot": plot_paths["scatter"],
         "error_time_plot": plot_paths["error_time"],
     }
+
+
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run water-level inference outside Gradio and print raw errors in Colab."
+    )
+    parser.add_argument("--model_path", required=True, help="Path to best_model.pth")
+    parser.add_argument("--scaler_path", required=True, help="Path to scaler.pkl")
+    parser.add_argument(
+        "--labels_csv_path",
+        help="Optional labels.csv from acquisition. If set, inference uses CSV image paths and true water levels.",
+    )
+    parser.add_argument(
+        "--image_folder",
+        help="Folder containing JPG/PNG images. Used when --labels_csv_path is not provided.",
+    )
+    parser.add_argument(
+        "--timestamp_file_path",
+        help="Optional CSV/TXT with image timestamps for image-folder inference.",
+    )
+    parser.add_argument(
+        "--config_path",
+        default="",
+        help="Optional training config.json. Used to resolve ROI for labels CSV inference.",
+    )
+    parser.add_argument("--site_name", default=SITE_NAME, help="Site name to store in labels CSV inference output.")
+    parser.add_argument("--input_img_size", type=int, default=384, help="Model input image size.")
+    parser.add_argument("--batch_size", type=int, default=1, help="Inference batch size.")
+    parser.add_argument("--output_dir", default=DEFAULT_INFERENCE_OUTPUT_DIR, help="Directory for inference outputs.")
+    parser.add_argument(
+        "--no_roi",
+        action="store_true",
+        help="Use whole images instead of the Pinewood/default ROI for direct image-folder inference.",
+    )
+    parser.add_argument(
+        "--fetch_usgs_true",
+        action="store_true",
+        help="Fetch nearest USGS true values for direct image-folder inference.",
+    )
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = _build_cli_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if args.labels_csv_path:
+            site_info = {
+                "site_no": SITE_ID,
+                "camId": CAM_ID,
+                "roi": None if args.no_roi else PINEWOOD_ROI,
+            }
+            roi, roi_message = resolve_roi_from_training_config(
+                args.config_path,
+                site_info.get("roi"),
+            )
+            print(f"[inference] {roi_message}", flush=True)
+            result = run_inference_from_labels(
+                labels_csv_path=args.labels_csv_path,
+                model_path=args.model_path,
+                scaler_path=args.scaler_path,
+                site_name=args.site_name,
+                site_info=site_info,
+                roi=roi,
+                input_img_size=args.input_img_size,
+                batch_size=args.batch_size,
+                output_dir=args.output_dir,
+            )
+        else:
+            result = run_inference(
+                model_path=args.model_path,
+                scaler_path=args.scaler_path,
+                image_folder=args.image_folder,
+                timestamp_file_path=args.timestamp_file_path,
+                input_img_size=args.input_img_size,
+                batch_size=args.batch_size,
+                use_pinewood_roi=not args.no_roi,
+                fetch_usgs_true=args.fetch_usgs_true,
+                output_dir=args.output_dir,
+            )
+
+        print("\n" + result["status"], flush=True)
+        print(f"\nPrediction CSV: {result['csv_path']}", flush=True)
+        return 0
+    except Exception:
+        tb = traceback.format_exc()
+        print(tb, flush=True)
+        log_path = save_error_traceback(tb)
+        print(f"Full inference traceback saved to: {log_path}", flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

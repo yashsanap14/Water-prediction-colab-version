@@ -771,7 +771,10 @@ def run_inference_handler(
         _log(f"[inference] Model file exists: {os.path.exists(model_check_path)} | {model_check_path}")
         _log(f"[inference] Scaler file exists: {os.path.exists(scaler_check_path)} | {scaler_check_path}")
         _log(f"[inference] Config file exists: {os.path.exists(config_check_path)} | {config_check_path}")
-        _log(f"[inference] Labels CSV exists: {os.path.exists(labels_check_path)} | {labels_check_path}")
+        if labels_check_path:
+            _log(f"[inference] Existing labels CSV override exists: {os.path.exists(labels_check_path)} | {labels_check_path}")
+        else:
+            _log(f"[inference] Existing labels CSV override is blank; downloading new inference images/labels into {INFERENCE_DATA_DIR}")
         _log(f"[inference] Output directory exists or created: {os.path.isdir(INFERENCE_OUTPUT_DIR)} | {INFERENCE_OUTPUT_DIR}")
 
         if labels_check_path:
@@ -793,6 +796,7 @@ def run_inference_handler(
                 api_key=api_key.strip() if api_key else None,
                 log_cb=_log,
             )
+            _log(f"[inference] Generated inference labels CSV: {csv_path}")
 
         site_info = da.SITE_CATALOG[site_name]
         current_step = "resolving the training ROI from config.json"
@@ -1280,9 +1284,9 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
                         placeholder="/content/water_level_demo/results/config.json",
                     )
                     inference_labels_csv_path = gr.Textbox(
-                        label="Labels CSV path",
-                        value=DEFAULT_LABELS_CSV_PATH,
-                        placeholder="/content/water_level_demo/data/labels.csv",
+                        label="Existing labels CSV path (optional)",
+                        value="",
+                        placeholder="Leave blank to download into /content/water_level_demo/inference/data/labels.csv",
                     )
                     inference_img_size = gr.Number(
                         value=None,

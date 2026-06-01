@@ -135,15 +135,20 @@ def resolve_input_img_size_from_training_config(
     """
     Resolve inference image size.
 
-    A user-supplied size wins. Otherwise use config.json input_img_size. If the
-    config is unavailable or invalid, fall back to fallback_input_img_size.
+    A positive user-supplied size wins. A value of 0 is treated as blank because
+    Gradio can send an empty Number field as 0. Otherwise use config.json
+    input_img_size. If the config is unavailable or invalid, fall back to
+    fallback_input_img_size.
     """
     if requested_input_img_size not in (None, ""):
         try:
             value = int(requested_input_img_size)
-            if value <= 0:
+            if value == 0:
+                requested_input_img_size = None
+            elif value < 0:
                 raise ValueError("must be positive")
-            return value, f"Using manually supplied input image size: {value}."
+            else:
+                return value, f"Using manually supplied input image size: {value}."
         except Exception as e:
             raise ValueError(f"Input image size override is invalid: {requested_input_img_size} ({e})") from e
 

@@ -705,7 +705,8 @@ def _optional_int(value):
             return None
     except TypeError:
         pass
-    return int(value)
+    parsed = int(value)
+    return parsed if parsed > 0 else None
 
 
 def run_inference_handler(
@@ -1263,7 +1264,7 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
                     inference_img_size = gr.Number(
                         value=None,
                         precision=0,
-                        label="Input image size override (blank = config.json)",
+                        label="Input image size override (blank/0 = config.json)",
                     )
                     inference_batch_size = gr.Slider(
                         minimum=1,

@@ -50,6 +50,8 @@ else:
     )
 
 DEFAULT_RESULTS_DIR = os.path.join(DEFAULT_BASE_DIR, "results")
+DEFAULT_DATA_DIR = os.path.join(DEFAULT_BASE_DIR, "data")
+DEFAULT_LABELS_CSV_PATH = os.path.join(DEFAULT_DATA_DIR, "labels.csv")
 DEFAULT_INFERENCE_OUTPUT_DIR = os.path.join(DEFAULT_RESULTS_DIR, "inference")
 DEFAULT_ERROR_LOG_PATH = os.path.join(DEFAULT_RESULTS_DIR, "inference_error_log.txt")
 
@@ -72,6 +74,20 @@ def save_error_traceback(traceback_text: str, error_log_path: str = DEFAULT_ERRO
     return path
 
 
+def load_training_config(config_path: Optional[str]) -> tuple[dict, str, str]:
+    """Read training config.json if available and return (config, path, message)."""
+    path = os.path.expanduser(str(config_path or "").strip())
+    if not path:
+        return {}, path, "Training config path is blank."
+    if not os.path.exists(path):
+        return {}, path, f"Training config not found: {path}"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f), path, f"Training config loaded: {path}"
+    except Exception as e:
+        return {}, path, f"Training config could not be read ({e}): {path}"
+
+
 def resolve_roi_from_training_config(
     config_path: Optional[str],
     fallback_roi: Optional[Tuple[int, int, int, int]],
@@ -83,19 +99,16 @@ def resolve_roi_from_training_config(
     whole image.
     """
     fallback = tuple(int(v) for v in fallback_roi) if fallback_roi is not None else None
-    path = os.path.expanduser(str(config_path or "").strip())
+    config, path, config_message = load_training_config(config_path)
 
-    if not path or not os.path.exists(path):
-        return fallback, f"Training config not found; using site catalog ROI: {fallback or 'whole image'}."
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    except Exception as e:
-        return fallback, f"Training config could not be read ({e}); using site catalog ROI: {fallback or 'whole image'}."
+    if not config:
+        return fallback, f"{config_message}; using site catalog ROI: {fallback or 'whole image'}."
 
     if "roi" not in config:
-        return fallback, f"Training config has no ROI field; using site catalog ROI: {fallback or 'whole image'}."
+        return fallback, (
+            f"{config_message}; no ROI field found, using site catalog ROI: "
+            f"{fallback or 'whole image'}."
+        )
 
     roi = config.get("roi")
     if roi is None:
@@ -111,7 +124,82 @@ def resolve_roi_from_training_config(
     except Exception as e:
         return fallback, f"Training config ROI is invalid ({e}); using site catalog ROI: {fallback or 'whole image'}."
 
-    return resolved, f"Using ROI from training config: {resolved}."
+    return resolved, f"Using ROI from training config {path}: {resolved}."
+
+
+def resolve_input_img_size_from_training_config(
+    config_path: Optional[str],
+    requested_input_img_size: Optional[int] = None,
+    fallback_input_img_size: int = 384,
+) -> tuple[int, str]:
+    """
+    Resolve inference image size.
+
+    A user-supplied size wins. Otherwise use config.json input_img_size. If the
+    config is unavailable or invalid, fall back to fallback_input_img_size.
+    """
+    if requested_input_img_size not in (None, ""):
+        try:
+            value = int(requested_input_img_size)
+            if value <= 0:
+                raise ValueError("must be positive")
+            return value, f"Using manually supplied input image size: {value}."
+        except Exception as e:
+            raise ValueError(f"Input image size override is invalid: {requested_input_img_size} ({e})") from e
+
+    config, path, config_message = load_training_config(config_path)
+    if config and config.get("input_img_size") not in (None, ""):
+        try:
+            value = int(config["input_img_size"])
+            if value <= 0:
+                raise ValueError("must be positive")
+            return value, f"Using input image size from training config {path}: {value}."
+        except Exception as e:
+            return int(fallback_input_img_size), (
+                f"{config_message}; config input_img_size is invalid ({e}); "
+                f"using fallback image size {int(fallback_input_img_size)}."
+            )
+
+    return int(fallback_input_img_size), (
+        f"{config_message}; no input_img_size found, using fallback image size "
+        f"{int(fallback_input_img_size)}."
+    )
+
+
+def _log_path_status(
+    log_callback: Optional[Callable[[str], None]],
+    label: str,
+    path: str,
+    expect_dir: bool = False,
+) -> None:
+    exists = os.path.isdir(path) if expect_dir else os.path.exists(path)
+    kind = "directory" if expect_dir else "file"
+    _log_step(log_callback, f"{label} {kind} exists: {exists} | {path}")
+
+
+def _log_model_scaler_pair(
+    log_callback: Optional[Callable[[str], None]],
+    model_path: str,
+    scaler_path: str,
+    config_path: Optional[str] = None,
+) -> None:
+    model_base = os.path.basename(model_path)
+    scaler_base = os.path.basename(scaler_path)
+    same_dir = os.path.dirname(model_path) == os.path.dirname(scaler_path)
+    generic_pair = model_base == "best_model.pth" and scaler_base == "scaler.pkl"
+    if same_dir and generic_pair:
+        _log_step(log_callback, "Model/scaler pairing: generic training artifacts from the same results directory.")
+    elif same_dir:
+        _log_step(log_callback, f"Model/scaler pairing: both artifacts are from the same directory: {os.path.dirname(model_path)}")
+    else:
+        _log_step(log_callback, "Model/scaler pairing warning: model and scaler are from different directories.")
+    if config_path:
+        config_dir = os.path.dirname(os.path.expanduser(str(config_path).strip()))
+        if same_dir and config_dir == os.path.dirname(model_path):
+            _log_step(log_callback, "Artifact group: model, scaler, and config are all from the same results directory.")
+        else:
+            _log_step(log_callback, "Artifact group warning: model, scaler, and config are not all from the same directory.")
+
 
 
 def _uploaded_file_path(uploaded_file) -> Optional[str]:
@@ -436,17 +524,34 @@ def run_inference_from_labels(
     site_name: str,
     site_info: dict,
     roi: Optional[Tuple[int, int, int, int]],
-    input_img_size: int = 384,
+    config_path: Optional[str] = None,
+    input_img_size: Optional[int] = None,
     batch_size: int = 1,
     output_dir: str = DEFAULT_INFERENCE_OUTPUT_DIR,
     log_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Run inference from a USGS acquisition labels CSV."""
+    output_dir = os.path.expanduser(str(output_dir).strip())
     os.makedirs(output_dir, exist_ok=True)
+    _log_path_status(log_callback, "Output directory", output_dir, expect_dir=True)
+
     labels_path = os.path.expanduser(str(labels_csv_path).strip())
-    _log_step(log_callback, f"Checking CSV path: {labels_path}")
+    _log_path_status(log_callback, "Labels CSV", labels_path)
     if not labels_path or not os.path.exists(labels_path):
         raise ValueError(f"Labels CSV not found: {labels_csv_path}")
+
+    config_check_path = os.path.expanduser(str(config_path or "").strip())
+    if config_path:
+        _log_path_status(log_callback, "Config", config_check_path)
+
+    resolved_input_img_size, img_size_message = resolve_input_img_size_from_training_config(
+        config_path,
+        requested_input_img_size=input_img_size,
+        fallback_input_img_size=384,
+    )
+    _log_step(log_callback, img_size_message)
+    _log_step(log_callback, f"Input image size being used: {resolved_input_img_size}")
+    _log_step(log_callback, f"ROI being used: {roi or 'whole image'}")
 
     _log_step(log_callback, "Reading labels CSV")
     df = pd.read_csv(labels_path)
@@ -461,26 +566,37 @@ def run_inference_from_labels(
         )
 
     model_check_path = os.path.expanduser(str(model_path).strip())
-    _log_step(log_callback, f"Checking model path: {model_check_path}")
+    _log_path_status(log_callback, "Model", model_check_path)
     if not model_check_path or not os.path.exists(model_check_path):
         raise ValueError(f"Model file not found: {model_path}")
 
     scaler_check_path = os.path.expanduser(str(scaler_path).strip())
-    _log_step(log_callback, f"Checking scaler path: {scaler_check_path}")
+    _log_path_status(log_callback, "Scaler", scaler_check_path)
     if not scaler_check_path or not os.path.exists(scaler_check_path):
         raise ValueError(f"Scaler file not found: {scaler_path}")
+    _log_model_scaler_pair(log_callback, model_check_path, scaler_check_path, config_check_path)
 
     _log_step(log_callback, "Loading scaler")
     scaler = load_scaler(scaler_path)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     _log_step(log_callback, f"Loading model on device: {device}")
     model, backbone, checkpoint_img_size = load_model(model_path, device)
+    _log_step(log_callback, f"Backbone being loaded: {backbone}")
+    _log_step(log_callback, f"Checkpoint image size: {checkpoint_img_size or 'not stored'}")
+    if input_img_size in (None, "") and checkpoint_img_size:
+        config, _, _ = load_training_config(config_path)
+        if not config.get("input_img_size") and resolved_input_img_size != int(checkpoint_img_size):
+            resolved_input_img_size = int(checkpoint_img_size)
+            _log_step(
+                log_callback,
+                f"Using input image size from checkpoint because config.json did not provide one: {resolved_input_img_size}.",
+            )
 
     _log_step(log_callback, "Preparing dataset")
     mappings = {path: 0.0 for path in image_paths}
     ds = td.WaterLevelDataset(
         mappings,
-        input_img_size=int(input_img_size),
+        input_img_size=int(resolved_input_img_size),
         roi=roi,
         scaler=scaler,
         training=False,
@@ -591,7 +707,7 @@ def run_inference_from_labels(
         f"Device: {device}\n"
         f"Backbone: {backbone}\n"
         f"Checkpoint image size: {checkpoint_img_size or 'not stored'}\n"
-        f"Requested image size: {int(input_img_size)}\n"
+        f"Requested image size: {int(resolved_input_img_size)}\n"
         f"ROI: {roi or 'whole image'}\n"
         f"Labels CSV: {labels_path}\n"
         f"Output CSV: {csv_path}"
@@ -614,7 +730,7 @@ def run_inference(
     image_folder: Optional[str] = None,
     uploaded_files: Optional[Iterable] = None,
     timestamp_file_path: Optional[str] = None,
-    input_img_size: int = 600,
+    input_img_size: Optional[int] = None,
     batch_size: int = 1,
     use_pinewood_roi: bool = True,
     fetch_usgs_true: bool = False,
@@ -622,21 +738,24 @@ def run_inference(
     log_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Run model inference and save CSV/plot outputs."""
+    output_dir = os.path.expanduser(str(output_dir).strip())
     os.makedirs(output_dir, exist_ok=True)
+    _log_path_status(log_callback, "Output directory", output_dir, expect_dir=True)
 
     _log_step(log_callback, f"Checking image path input: {image_folder or 'uploaded files'}")
     image_paths = collect_image_files(image_folder, uploaded_files)
     _log_step(log_callback, f"Checking resolved image paths: {len(image_paths)} image(s)")
 
     model_check_path = os.path.expanduser(str(model_path).strip())
-    _log_step(log_callback, f"Checking model path: {model_check_path}")
+    _log_path_status(log_callback, "Model", model_check_path)
     if not model_check_path or not os.path.exists(model_check_path):
         raise ValueError(f"Model file not found: {model_path}")
 
     scaler_check_path = os.path.expanduser(str(scaler_path).strip())
-    _log_step(log_callback, f"Checking scaler path: {scaler_check_path}")
+    _log_path_status(log_callback, "Scaler", scaler_check_path)
     if not scaler_check_path or not os.path.exists(scaler_check_path):
         raise ValueError(f"Scaler file not found: {scaler_path}")
+    _log_model_scaler_pair(log_callback, model_check_path, scaler_check_path)
 
     if timestamp_file_path:
         timestamp_check_path = os.path.expanduser(str(timestamp_file_path).strip())
@@ -647,13 +766,18 @@ def run_inference(
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     _log_step(log_callback, f"Loading model on device: {device}")
     model, backbone, checkpoint_img_size = load_model(model_path, device)
+    resolved_input_img_size = int(input_img_size or checkpoint_img_size or 384)
+    _log_step(log_callback, f"Backbone being loaded: {backbone}")
+    _log_step(log_callback, f"Checkpoint image size: {checkpoint_img_size or 'not stored'}")
+    _log_step(log_callback, f"Input image size being used: {resolved_input_img_size}")
 
     roi = PINEWOOD_ROI if use_pinewood_roi else None
+    _log_step(log_callback, f"ROI being used: {roi or 'whole image'}")
     _log_step(log_callback, "Preparing dataset")
     mappings = {path: 0.0 for path in image_paths}
     ds = td.WaterLevelDataset(
         mappings,
-        input_img_size=int(input_img_size),
+        input_img_size=resolved_input_img_size,
         roi=roi,
         scaler=scaler,
         training=False,
@@ -749,7 +873,7 @@ def run_inference(
         f"Device: {device}\n"
         f"Backbone: {backbone}\n"
         f"Checkpoint image size: {checkpoint_img_size or 'not stored'}\n"
-        f"Requested image size: {int(input_img_size)}\n"
+        f"Requested image size: {int(resolved_input_img_size)}\n"
         f"ROI: {roi or 'whole image'}\n"
         f"{usgs_message}\n"
         f"CSV saved: {csv_path}"
@@ -789,7 +913,12 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         help="Optional training config.json. Used to resolve ROI for labels CSV inference.",
     )
     parser.add_argument("--site_name", default=SITE_NAME, help="Site name to store in labels CSV inference output.")
-    parser.add_argument("--input_img_size", type=int, default=384, help="Model input image size.")
+    parser.add_argument(
+        "--input_img_size",
+        type=int,
+        default=None,
+        help="Optional model input image size override. Omit to use config.json when available.",
+    )
     parser.add_argument("--batch_size", type=int, default=1, help="Inference batch size.")
     parser.add_argument("--output_dir", default=DEFAULT_INFERENCE_OUTPUT_DIR, help="Directory for inference outputs.")
     parser.add_argument(
@@ -828,6 +957,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 site_name=args.site_name,
                 site_info=site_info,
                 roi=roi,
+                config_path=args.config_path,
                 input_img_size=args.input_img_size,
                 batch_size=args.batch_size,
                 output_dir=args.output_dir,

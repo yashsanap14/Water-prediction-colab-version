@@ -40,10 +40,12 @@ DATA_DIR    = os.path.join(BASE_DIR, "data")
 IMAGES_DIR  = os.path.join(DATA_DIR, "images")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 INFERENCE_DATA_DIR = os.path.join(BASE_DIR, "inference", "data")
+DEFAULT_LABELS_CSV_PATH = os.path.join(DATA_DIR, "labels.csv")
+INFERENCE_OUTPUT_DIR = os.path.join(RESULTS_DIR, "inference")
 INFERENCE_ERROR_LOG_PATH = os.path.join(RESULTS_DIR, "inference_error_log.txt")
 DRIVE_DIR   = "/content/drive/MyDrive/water_level_demo/results"
 
-for d in [BASE_DIR, DATA_DIR, IMAGES_DIR, RESULTS_DIR, INFERENCE_DATA_DIR]:
+for d in [BASE_DIR, DATA_DIR, IMAGES_DIR, RESULTS_DIR, INFERENCE_DATA_DIR, INFERENCE_OUTPUT_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -694,17 +696,30 @@ def _format_inference_traceback_error(error, step, log_lines, tb, log_path):
         + f"\nFull traceback saved to:\n{log_path}"
     )
 
+
+def _optional_int(value):
+    if value in (None, ""):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    return int(value)
+
+
 def run_inference_handler(
     model_path,
     scaler_path,
     config_path,
+    labels_csv_path,
     site_name,
     start_date,
     end_date,
     max_images,
     param_selection,
     api_key,
-    input_img_size,
+    input_img_size_override,
     batch_size,
 ):
     log_lines = []
@@ -729,17 +744,35 @@ def run_inference_handler(
         def _log(msg):
             log_lines.append(str(msg))
 
-        current_step = "downloading HiVIS images and matching USGS parameters"
-        csv_path, matched, _ = da.run_acquisition(
-            site_name=site_name,
-            start_date=start_date,
-            end_date=end_date,
-            max_images=int(max_images),
-            param_codes=param_codes,
-            dest_dir=INFERENCE_DATA_DIR,
-            api_key=api_key.strip() if api_key else None,
-            log_cb=_log,
-        )
+        model_check_path = os.path.expanduser(str(model_path or "").strip())
+        scaler_check_path = os.path.expanduser(str(scaler_path or "").strip())
+        config_check_path = os.path.expanduser(str(config_path or "").strip())
+        labels_check_path = os.path.expanduser(str(labels_csv_path or "").strip())
+        _log(f"[inference] Model file exists: {os.path.exists(model_check_path)} | {model_check_path}")
+        _log(f"[inference] Scaler file exists: {os.path.exists(scaler_check_path)} | {scaler_check_path}")
+        _log(f"[inference] Config file exists: {os.path.exists(config_check_path)} | {config_check_path}")
+        _log(f"[inference] Labels CSV exists: {os.path.exists(labels_check_path)} | {labels_check_path}")
+        _log(f"[inference] Output directory exists or created: {os.path.isdir(INFERENCE_OUTPUT_DIR)} | {INFERENCE_OUTPUT_DIR}")
+
+        if labels_check_path:
+            csv_path = labels_check_path
+            current_step = "checking existing labels CSV"
+            if not os.path.exists(csv_path):
+                raise ValueError(f"Labels CSV not found: {csv_path}")
+            matched = len(pd.read_csv(csv_path))
+            _log(f"[inference] Using existing labels CSV: {csv_path}")
+        else:
+            current_step = "downloading HiVIS images and matching USGS parameters"
+            csv_path, matched, _ = da.run_acquisition(
+                site_name=site_name,
+                start_date=start_date,
+                end_date=end_date,
+                max_images=int(max_images),
+                param_codes=param_codes,
+                dest_dir=INFERENCE_DATA_DIR,
+                api_key=api_key.strip() if api_key else None,
+                log_cb=_log,
+            )
 
         site_info = da.SITE_CATALOG[site_name]
         current_step = "resolving the training ROI from config.json"
@@ -747,19 +780,20 @@ def run_inference_handler(
             config_path,
             site_info.get("roi"),
         )
+        _log(f"[inference] {roi_message}")
 
-        output_dir = os.path.join(RESULTS_DIR, "inference")
         current_step = "loading model/scaler and running predictions"
         result = inf.run_inference_from_labels(
             labels_csv_path=csv_path,
-            input_img_size=int(input_img_size),
+            input_img_size=_optional_int(input_img_size_override),
             batch_size=int(batch_size),
             model_path=model_path,
             scaler_path=scaler_path,
             site_name=site_name,
             site_info=site_info,
             roi=roi,
-            output_dir=output_dir,
+            config_path=config_path,
+            output_dir=INFERENCE_OUTPUT_DIR,
             log_callback=_log,
         )
 
@@ -1221,12 +1255,15 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
                         value=os.path.join(RESULTS_DIR, "config.json"),
                         placeholder="/content/water_level_demo/results/config.json",
                     )
-                    inference_img_size = gr.Slider(
-                        minimum=224,
-                        maximum=800,
-                        value=384,
-                        step=32,
-                        label="Input image size (px)",
+                    inference_labels_csv_path = gr.Textbox(
+                        label="Labels CSV path",
+                        value=DEFAULT_LABELS_CSV_PATH,
+                        placeholder="/content/water_level_demo/data/labels.csv",
+                    )
+                    inference_img_size = gr.Number(
+                        value=None,
+                        precision=0,
+                        label="Input image size override (blank = config.json)",
                     )
                     inference_batch_size = gr.Slider(
                         minimum=1,
@@ -1274,6 +1311,7 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
                     inference_model_path,
                     inference_scaler_path,
                     inference_config_path,
+                    inference_labels_csv_path,
                     inference_site_dd,
                     inference_start_date,
                     inference_end_date,

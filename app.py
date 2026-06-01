@@ -64,6 +64,15 @@ _state = {
 
 _acq_queue: queue.Queue = queue.Queue()
 
+
+def _date_to_yyyy_mm_dd(value, field_name: str) -> str:
+    """Normalize Gradio DateTime/string values to the USGS YYYY-MM-DD format."""
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError(f"{field_name} must be a valid date.")
+    return pd.Timestamp(parsed).strftime("%Y-%m-%d")
+
+
 def _acquisition_thread(site_name, start_date, end_date, max_images,
                         param_codes, api_key):
     def _log(msg):
@@ -118,6 +127,13 @@ def start_acquisition(site_name, start_date, end_date, max_images,
 
     if not param_codes:
         yield "Please select at least one USGS parameter.", get_acquisition_summary()
+        return
+
+    try:
+        start_date = _date_to_yyyy_mm_dd(start_date, "Start date")
+        end_date = _date_to_yyyy_mm_dd(end_date, "End date")
+    except ValueError as e:
+        yield str(e), get_acquisition_summary()
         return
 
     # Flush queue
@@ -745,6 +761,9 @@ def run_inference_handler(
         def _log(msg):
             log_lines.append(str(msg))
 
+        start_date = _date_to_yyyy_mm_dd(start_date, "Inference start date")
+        end_date = _date_to_yyyy_mm_dd(end_date, "Inference end date")
+
         model_check_path = os.path.expanduser(str(model_path or "").strip())
         scaler_check_path = os.path.expanduser(str(scaler_path or "").strip())
         config_check_path = os.path.expanduser(str(config_path or "").strip())
@@ -906,15 +925,17 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
                         value=SITE_CHOICES[0],
                     )
                     with gr.Row():
-                        start_date_in = gr.Textbox(
-                            label="Start Date (YYYY-MM-DD)",
+                        start_date_in = gr.DateTime(
+                            label="Start Date",
                             value="2025-01-01",
-                            placeholder="2025-01-01",
+                            include_time=False,
+                            type="string",
                         )
-                        end_date_in = gr.Textbox(
-                            label="End Date (YYYY-MM-DD)",
+                        end_date_in = gr.DateTime(
+                            label="End Date",
                             value="2025-03-31",
-                            placeholder="2025-03-31",
+                            include_time=False,
+                            type="string",
                         )
                     max_img_slider = gr.Slider(
                         minimum=50, maximum=500, value=200, step=10,
@@ -1216,15 +1237,17 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
                         value=SITE_CHOICES[0],
                     )
                     with gr.Row():
-                        inference_start_date = gr.Textbox(
-                            label="Start Date (YYYY-MM-DD)",
+                        inference_start_date = gr.DateTime(
+                            label="Start Date",
                             value="2025-01-01",
-                            placeholder="2025-01-01",
+                            include_time=False,
+                            type="string",
                         )
-                        inference_end_date = gr.Textbox(
-                            label="End Date (YYYY-MM-DD)",
+                        inference_end_date = gr.DateTime(
+                            label="End Date",
                             value="2025-03-31",
-                            placeholder="2025-03-31",
+                            include_time=False,
+                            type="string",
                         )
                     inference_max_images = gr.Slider(
                         minimum=10, maximum=500, value=100, step=10,
@@ -1348,6 +1371,12 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
         share=share,
         debug=debug,
         show_error=show_error,
+        allowed_paths=[
+            BASE_DIR,
+            DATA_DIR,
+            RESULTS_DIR,
+            INFERENCE_OUTPUT_DIR,
+        ],
     )
     return demo
 

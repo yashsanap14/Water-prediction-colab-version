@@ -6,13 +6,13 @@ Adapted from the production training pipeline.
 
 Key changes from production:
   - No AWS / S3 / boto3 dependencies
-  - Results saved to /content/water_level_demo/results/ or Google Drive
+  - Training results saved under /content/water_level_demo/results/training/ or Google Drive
   - Mixed-precision (torch.cuda.amp) support
   - Num_workers capped at 2 for Colab stability
   - CUDA OOM error is caught with a helpful message
   - Smaller EfficientNet option (b3 vs l2) for T4 memory budget
   - ROI cropping preserved from the production Datasets class
-  - StandardScaler saved as scaler.pkl (separate file), matching production
+  - StandardScaler saved as a site-specific .pkl file
 """
 
 import os
@@ -591,6 +591,81 @@ def _should_log_progress(step: int, total: int) -> bool:
     return step == 1 or step == total or step % interval == 0
 
 
+def describe_roi(roi: Optional[Tuple[int, int, int, int]]) -> dict:
+    """Return ROI dimensions/orientation for the project-wide XYXY format."""
+    if roi is None:
+        return {
+            "roi": None,
+            "width": None,
+            "height": None,
+            "orientation": "whole image",
+        }
+    x1, y1, x2, y2 = [int(v) for v in roi]
+    width = x2 - x1
+    height = y2 - y1
+    if height > width:
+        orientation = "vertical strip"
+    elif width > height:
+        orientation = "horizontal strip"
+    else:
+        orientation = "square crop"
+    return {
+        "roi": (x1, y1, x2, y2),
+        "width": width,
+        "height": height,
+        "orientation": orientation,
+    }
+
+
+def _save_debug_crop_samples(
+    mappings: dict,
+    roi: Optional[Tuple[int, int, int, int]],
+    output_dir: str,
+    max_samples: int = 5,
+) -> list[str]:
+    """
+    Save pre-resize, pre-normalization training crops for visual inspection.
+
+    The crop uses the same project-wide ROI convention as preview/training:
+    (x1, y1, x2, y2) = (left, top, right, bottom).
+    """
+    if roi is None:
+        return []
+
+    from PIL import Image
+
+    os.makedirs(output_dir, exist_ok=True)
+    for filename in os.listdir(output_dir):
+        if filename.startswith("crop_sample_") and filename.endswith(".png"):
+            try:
+                os.remove(os.path.join(output_dir, filename))
+            except OSError:
+                pass
+
+    x1, y1, x2, y2 = [int(v) for v in roi]
+    saved = []
+    for path in list(mappings.keys()):
+        if len(saved) >= max_samples:
+            break
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            continue
+        try:
+            with Image.open(path) as img:
+                img = img.convert("RGB")
+                width, height = img.size
+                x1c, x2c = max(0, x1), min(width, x2)
+                y1c, y2c = max(0, y1), min(height, y2)
+                if x1c >= x2c or y1c >= y2c:
+                    continue
+                cropped = img.crop((x1c, y1c, x2c, y2c))
+                out_path = os.path.join(output_dir, f"crop_sample_{len(saved) + 1}.png")
+                cropped.save(out_path)
+                saved.append(out_path)
+        except Exception:
+            continue
+    return saved
+
+
 # ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
@@ -682,6 +757,18 @@ def train_model(
             f"{_format_progress_bar(step, total)} {pct:5.1f}% ({step}/{total}){suffix}"
         )
 
+    roi_debug = describe_roi(roi)
+    _log("\n🔎 ROI debug")
+    if roi is None:
+        _log("   ROI passed to train_model(): whole image")
+        _log("   Training will use full original images.")
+    else:
+        _log(f"   ROI passed to train_model(): {roi_debug['roi']}")
+        _log(f"   ROI format: (x1, y1, x2, y2) = (left, top, right, bottom)")
+        _log(f"   Crop width: {roi_debug['width']} px")
+        _log(f"   Crop height: {roi_debug['height']} px")
+        _log(f"   Crop orientation: {roi_debug['orientation']}")
+
     # ── Device ────────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
@@ -702,13 +789,31 @@ def train_model(
     )
     _log(f"   Train: {len(train_map)} | Val: {len(val_map)} | Test: {len(test_map)}")
 
+    debug_crop_dir = os.path.join(results_dir, "debug_crops")
+    if roi is not None:
+        debug_crop_paths = _save_debug_crop_samples(
+            train_map,
+            roi,
+            debug_crop_dir,
+            max_samples=5,
+        )
+        _log(f"\n🖼️  Debug cropped samples saved to: {debug_crop_dir}")
+        if debug_crop_paths:
+            for path in debug_crop_paths:
+                _log(f"   {path}")
+        else:
+            _log("   No debug crop samples could be saved. Check image paths and ROI bounds.")
+    else:
+        debug_crop_paths = []
+        _log("\n🖼️  Debug cropped samples skipped because training uses whole images.")
+
     # Save split summary
     split_summary = pd.DataFrame([
         {"split": "train", "count": len(train_map)},
         {"split": "val",   "count": len(val_map)},
         {"split": "test",  "count": len(test_map)},
     ])
-    split_summary_path = os.path.join(results_dir, "split_summary.csv")
+    split_summary_path = os.path.join(results_dir, f"split_summary_{site_slug}.csv")
     split_summary.to_csv(split_summary_path, index=False)
 
     # ── Datasets  (Step 8 equivalent) ────────────────────────────────────
@@ -719,14 +824,20 @@ def train_model(
         test_map, input_img_size, roi, scaler=train_ds.scaler,
         training=False, include_paths=True,
     )
+    dataset_roi_debug = describe_roi(train_ds.roi)
+    if train_ds.roi is None:
+        _log("   ROI received by Dataset: whole image")
+    else:
+        _log(f"   ROI received by Dataset: {dataset_roi_debug['roi']}")
+        _log(f"   Dataset crop width: {dataset_roi_debug['width']} px")
+        _log(f"   Dataset crop height: {dataset_roi_debug['height']} px")
+        _log(f"   Dataset crop orientation: {dataset_roi_debug['orientation']}")
 
-    # Save scaler (production style: separate .pkl file)
-    scaler_path = os.path.join(results_dir, "scaler.pkl")
-    with open(scaler_path, "wb") as f:
-        pickle.dump(train_ds.scaler, f)
+    # Save scaler as a site-specific artifact.
     scaler_site_path = os.path.join(results_dir, f"scaler_{site_slug}.pkl")
     with open(scaler_site_path, "wb") as f:
         pickle.dump(train_ds.scaler, f)
+    scaler_path = scaler_site_path
     _log(f"   Scaler saved → {scaler_path}")
 
     # Colab-safe DataLoader settings
@@ -777,8 +888,8 @@ def train_model(
     train_losses, val_losses = [], []
     best_val_loss  = float("inf")
     epochs_without_improvement = 0
-    best_model_path = os.path.join(results_dir, "best_model.pth")
     best_model_site_path = os.path.join(results_dir, f"best_model_{site_slug}.pth")
+    best_model_path = best_model_site_path
     start_time      = time.time()
 
     _log(f"\n🚀 Starting training: {num_epochs} epoch(s) | batch={batch_size} | img={input_img_size}px\n")
@@ -880,18 +991,6 @@ def train_model(
                     },
                     best_model_path,
                 )
-                torch.save(
-                    {
-                        "epoch":               epoch,
-                        "model_state_dict":    model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "train_loss":          avg_train_loss,
-                        "val_loss":            avg_val_loss,
-                        "backbone":            backbone_name,
-                        "input_img_size":      input_img_size,
-                    },
-                    best_model_site_path,
-                )
                 _log(f"  ⭐ New best model saved! (val_loss={best_val_loss:.4f})")
                 epochs_without_improvement = 0
             else:
@@ -959,7 +1058,7 @@ def train_model(
         raise
 
     # ── Save loss history ─────────────────────────────────────────────────
-    history_path = os.path.join(results_dir, "training_history.csv")
+    history_path = os.path.join(results_dir, f"training_history_{site_slug}.csv")
     pd.DataFrame({
         "epoch":      list(range(1, len(train_losses) + 1)),
         "train_loss": train_losses,
@@ -993,6 +1092,7 @@ def train_model(
         "num_workers":       worker_count,
         "pin_memory":        use_pin_memory,
         "roi":               list(roi) if roi else None,
+        "debug_crop_dir":    debug_crop_dir if roi else None,
         "n_train":           len(train_map),
         "n_val":             len(val_map),
         "n_test":            len(test_map),
@@ -1000,13 +1100,16 @@ def train_model(
         "total_time_s":      round(time.time() - start_time, 1),
         "completed_at":      datetime.now().isoformat(),
     }
-    config_path = os.path.join(results_dir, "config.json")
+    config_path = os.path.join(results_dir, f"config_{site_slug}.json")
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
     _log(f"📄 Config saved → {config_path}")
 
     # ── Training loss plot ────────────────────────────────────────────────
-    plot_path = plot_training_loss(train_losses, val_losses, results_dir)
+    plot_path = plot_training_loss(
+        train_losses, val_losses, results_dir,
+        filename=f"training_loss_plot_{site_slug}.png",
+    )
     loss_curves_site_path = plot_training_loss(
         train_losses, val_losses, results_dir, filename=f"loss_curves_{site_slug}.png"
     )
@@ -1038,9 +1141,10 @@ def train_model(
         try:
             import shutil
             os.makedirs(drive_dir, exist_ok=True)
-            for fname in ["best_model.pth", "scaler.pkl", "training_history.csv",
-                          "training_loss_plot.png", "config.json", "split_summary.csv",
-                          f"best_model_{site_slug}.pth", f"scaler_{site_slug}.pkl",
+            for fname in [f"best_model_{site_slug}.pth", f"scaler_{site_slug}.pkl",
+                          f"training_history_{site_slug}.csv",
+                          f"training_loss_plot_{site_slug}.png",
+                          f"config_{site_slug}.json", f"split_summary_{site_slug}.csv",
                           f"test_results_{site_slug}.csv",
                           f"predictions_vs_actuals_{site_slug}.png",
                           f"loss_curves_{site_slug}.png"]:
@@ -1056,6 +1160,23 @@ def train_model(
     m, s       = divmod(rem, 60)
     _log(f"\n✅ Training complete in {h}h {m}m {s}s")
     _log(f"   Best val loss: {best_val_loss:.4f}")
+    _log(f"\nTraining artifacts saved to:\n{results_dir}")
+    _log("Saved training artifacts:")
+    for path in [
+        best_model_path,
+        scaler_path,
+        config_path,
+        history_path,
+        plot_path,
+        loss_curves_site_path,
+        predictions_plot_path,
+        test_results_path,
+        split_summary_path,
+    ]:
+        if path:
+            _log(f"   {path}")
+    if debug_crop_paths:
+        _log(f"   Debug crops directory: {debug_crop_dir}")
 
     return {
         "train_losses":   train_losses,
@@ -1075,6 +1196,8 @@ def train_model(
         "predictions_plot_path": predictions_plot_path,
         "metrics_summary": metrics_summary,
         "split_summary_path": split_summary_path,
+        "debug_crop_dir": debug_crop_dir if roi else None,
+        "debug_crop_paths": debug_crop_paths,
         "total_time_s":   total_time,
     }
 
@@ -1087,7 +1210,7 @@ def plot_training_loss(
     train_losses: list,
     val_losses: list,
     results_dir: str,
-    filename: str = "training_loss_plot.png",
+    filename: str,
 ) -> str:
     """
     Generate and save training/validation loss curve.

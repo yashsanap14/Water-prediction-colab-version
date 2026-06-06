@@ -14,6 +14,7 @@ import random
 import threading
 import queue
 import traceback
+import time
 from pathlib import Path
 
 import numpy as np
@@ -39,13 +40,17 @@ else:
 DATA_DIR    = os.path.join(BASE_DIR, "data")
 IMAGES_DIR  = os.path.join(DATA_DIR, "images")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
+TRAINING_RESULTS_DIR = os.path.join(RESULTS_DIR, "training")
 INFERENCE_DATA_DIR = os.path.join(BASE_DIR, "inference", "data")
 DEFAULT_LABELS_CSV_PATH = os.path.join(DATA_DIR, "labels.csv")
 INFERENCE_OUTPUT_DIR = os.path.join(RESULTS_DIR, "inference")
-INFERENCE_ERROR_LOG_PATH = os.path.join(RESULTS_DIR, "inference_error_log.txt")
-DRIVE_DIR   = "/content/drive/MyDrive/water_level_demo/results"
+INFERENCE_ERROR_LOG_PATH = os.path.join(INFERENCE_OUTPUT_DIR, "inference_error_log.txt")
+DRIVE_DIR   = "/content/drive/MyDrive/water_level_demo/results/training"
 
-for d in [BASE_DIR, DATA_DIR, IMAGES_DIR, RESULTS_DIR, INFERENCE_DATA_DIR, INFERENCE_OUTPUT_DIR]:
+for d in [
+    BASE_DIR, DATA_DIR, IMAGES_DIR, RESULTS_DIR,
+    TRAINING_RESULTS_DIR, INFERENCE_DATA_DIR, INFERENCE_OUTPUT_DIR,
+]:
     os.makedirs(d, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -65,6 +70,17 @@ _state = {
 _acq_queue: queue.Queue = queue.Queue()
 
 
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
 def _date_to_yyyy_mm_dd(value, field_name: str) -> str:
     """Normalize Gradio DateTime/string values to the USGS YYYY-MM-DD format."""
     parsed = pd.to_datetime(value, errors="coerce")
@@ -78,6 +94,7 @@ def _acquisition_thread(site_name, start_date, end_date, max_images,
     def _log(msg):
         _acq_queue.put(msg)
 
+    started_at = time.time()
     try:
         csv_path, matched, roi = da.run_acquisition(
             site_name  = site_name,
@@ -105,9 +122,11 @@ def _acquisition_thread(site_name, start_date, end_date, max_images,
         _state["csv_path"] = csv_path
 
         _log(f"\nDataset ready: {len(mappings)} labelled images.")
+        _log(f"Data acquisition completed in {_format_elapsed(time.time() - started_at)}.")
         _log("__DONE_OK__")
 
     except Exception as e:
+        _log(f"\nData acquisition stopped after {_format_elapsed(time.time() - started_at)}.")
         _log(f"\nError: {e}\n{traceback.format_exc()}")
         _log("__DONE_ERR__")
 
@@ -198,6 +217,18 @@ def _format_roi(roi):
         return ""
     x1, y1, x2, y2 = [int(v) for v in roi]
     return f"({x1}, {y1}, {x2}, {y2})"
+
+
+def _format_roi_training_message(roi):
+    if roi is None:
+        return "Training will use full original images."
+    debug = td.describe_roi(roi)
+    return (
+        f"Training will use ROI crop: (x1, y1, x2, y2) = {_format_roi(roi)}\n"
+        f"Crop width: {debug['width']} px\n"
+        f"Crop height: {debug['height']} px\n"
+        f"Crop orientation: {debug['orientation']}"
+    )
 
 
 def _available_image_paths():
@@ -319,7 +350,7 @@ def apply_manual_roi(x1, y1, x2, y2, sample_path, sample_size):
             orig,
             cropped,
             _format_roi(roi),
-            f"ROI selected: {_format_roi(roi)}",
+            f"ROI selected: {_format_roi(roi)}\n{_format_roi_training_message(roi)}",
             roi,
             [],
         )
@@ -373,7 +404,7 @@ def select_roi_point(sample_path, sample_size, clicks, current_roi, evt: gr.Sele
             orig,
             cropped,
             _format_roi(roi),
-            f"ROI selected: {_format_roi(roi)}",
+            f"ROI selected: {_format_roi(roi)}\n{_format_roi_training_message(roi)}",
             roi[0],
             roi[1],
             roi[2],
@@ -419,7 +450,8 @@ def preview_roi_handler(x1, y1, x2, y2):
         status = (
             f"Original: {orig.width}x{orig.height} px | "
             f"Cropped: {cropped.width}x{cropped.height} px | "
-            f"ROI: x1={roi[0]}, y1={roi[1]}, x2={roi[2]}, y2={roi[3]}"
+            f"ROI: x1={roi[0]}, y1={roi[1]}, x2={roi[2]}, y2={roi[3]}\n"
+            f"{_format_roi_training_message(roi)}"
         )
         return orig, cropped, status
     except Exception as e:
@@ -440,11 +472,16 @@ def site_roi_autofill(site_name):
 
         default_sel = _default_param_selection(site_name)
 
-        return x1, y1, x2, y2, f"ROI auto-filled for {site_name}", default_sel
+        roi = (x1, y1, x2, y2)
+        return (
+            x1, y1, x2, y2,
+            f"ROI auto-filled for {site_name}\n{_format_roi_training_message(roi)}",
+            default_sel,
+        )
 
     return (
         951, 0, 1136, 1920,
-        "Default Pinewood vertical strip ROI loaded.",
+        f"Default Pinewood vertical strip ROI loaded.\n{_format_roi_training_message(PINEWOOD_ROI_XYXY)}",
         _default_param_selection(SITE_CHOICES[0]),
     )
 
@@ -576,13 +613,32 @@ def start_training(
             yield f"Selected ROI is not valid for all training images. {e}", None, None, ""
             return
 
+    roi_debug = td.describe_roi(roi)
+    debug_crop_dir = os.path.join(TRAINING_RESULTS_DIR, "debug_crops")
+    if roi is None:
+        roi_log_lines = [
+            "ROI selected in UI: whole image",
+            "ROI passed to train_model(): whole image",
+            "Training will use full original images.",
+        ]
+    else:
+        roi_log_lines = [
+            f"ROI selected in UI: {_format_roi(selected_roi)}",
+            f"ROI passed to train_model(): {_format_roi(roi)}",
+            f"Training will use ROI crop: (x1, y1, x2, y2) = {_format_roi(roi)}",
+            f"Crop width: {roi_debug['width']} px",
+            f"Crop height: {roi_debug['height']} px",
+            f"Crop orientation: {roi_debug['orientation']}",
+            f"Debug cropped samples saved to: {debug_crop_dir}",
+        ]
+
     backbone = ("tf_efficientnet_b3.ns_jft_in1k" if use_small_backbone
                 else "tf_efficientnet_l2.ns_jft_in1k")
 
     kwargs = dict(
         mappings           = sub,
         roi                = roi,
-        results_dir        = RESULTS_DIR,
+        results_dir        = TRAINING_RESULTS_DIR,
         num_epochs         = int(n_epochs),
         batch_size         = int(batch_size),
         input_img_size     = int(img_size),
@@ -601,6 +657,8 @@ def start_training(
     while not _log_queue.empty():
         _log_queue.get_nowait()
     _train_result.clear()
+    for line in roi_log_lines:
+        _log_queue.put(line)
 
     thread = threading.Thread(target=_training_thread, args=(kwargs,), daemon=True)
     thread.start()
@@ -646,14 +704,15 @@ def get_training_outputs():
         f"Training Summary\n{'─'*40}\n"
         f"Best validation loss : {bvl_s}\n"
         f"Training time        : {h}h {m}m {s}s\n"
+        f"Training output dir  : {TRAINING_RESULTS_DIR}\n"
         f"Best model           : {_train_result.get('best_model_path', 'N/A')}\n"
-        f"Site model           : {_train_result.get('best_model_site_path', 'N/A')}\n"
         f"Scaler               : {_train_result.get('scaler_path', 'N/A')}\n"
         f"Test results         : {_train_result.get('test_results_csv_path') or _train_result.get('test_results_path', 'N/A')}\n"
         f"Predictions plot     : {_train_result.get('predictions_plot_path') or 'Not generated'}\n"
         f"Test metrics         : {metrics_summary}\n"
         f"Loss plot            : {plot_path or 'N/A'}\n"
         f"Site loss curves     : {_train_result.get('loss_curves_site_path', 'N/A')}\n"
+        f"Debug crops          : {_train_result.get('debug_crop_dir') or 'Not generated'}\n"
         f"Config               : {_train_result.get('config_path', 'N/A')}\n"
     )
     return loss_img, pred_img, summary
@@ -669,9 +728,9 @@ def _format_inference_error(error, step, log_lines):
     suggestions = []
 
     if "model file not found" in lower:
-        suggestions.append("Run training first, or set Model .pth path to an existing best_model.pth file.")
+        suggestions.append("Run training first, or set Model .pth path to an existing site-specific model in results/training.")
     if "scaler file not found" in lower:
-        suggestions.append("Run training first, or set Scaler .pkl path to the scaler.pkl saved with this model.")
+        suggestions.append("Run training first, or set Scaler .pkl path to the site-specific scaler saved with this model.")
     if "no hivis camera found" in lower:
         suggestions.append("Choose a site with an available USGS HiVIS camera.")
     if "no images found" in lower or "no images downloaded" in lower:
@@ -799,17 +858,31 @@ def run_inference_handler(
             _log(f"[inference] Generated inference labels CSV: {csv_path}")
 
         site_info = da.SITE_CATALOG[site_name]
-        current_step = "resolving the training ROI from config.json"
+        current_step = "resolving the training ROI from the training config file"
         roi, roi_message = inf.resolve_roi_from_training_config(
             config_path,
             site_info.get("roi"),
         )
         _log(f"[inference] {roi_message}")
 
+        requested_input_img_size = _optional_int(input_img_size_override)
+        resolved_input_img_size, img_size_message = inf.resolve_input_img_size_from_training_config(
+            config_path,
+            requested_input_img_size=requested_input_img_size,
+            fallback_input_img_size=384,
+        )
+        _log("[inference] Training artifacts being loaded:")
+        _log(f"[inference]   model path : {model_check_path}")
+        _log(f"[inference]   scaler path: {scaler_check_path}")
+        _log(f"[inference]   config path: {config_check_path}")
+        _log(f"[inference]   {img_size_message}")
+        _log(f"[inference]   image size : {resolved_input_img_size}")
+        _log(f"[inference]   ROI        : {roi or 'whole image'}")
+
         current_step = "loading model/scaler and running predictions"
         result = inf.run_inference_from_labels(
             labels_csv_path=csv_path,
-            input_img_size=_optional_int(input_img_size_override),
+            input_img_size=requested_input_img_size,
             batch_size=int(batch_size),
             model_path=model_path,
             scaler_path=scaler_path,
@@ -889,6 +962,25 @@ def _param_labels_for_codes(codes):
 def _default_param_selection(site_name):
     site_info = da.SITE_CATALOG.get(site_name, {})
     return _param_labels_for_codes(site_info.get("default_params", []))
+
+
+def _training_artifact_paths(site_name):
+    site_slug = td._slugify_site_name(site_name)
+    return {
+        "model": os.path.join(TRAINING_RESULTS_DIR, f"best_model_{site_slug}.pth"),
+        "scaler": os.path.join(TRAINING_RESULTS_DIR, f"scaler_{site_slug}.pkl"),
+        "config": os.path.join(TRAINING_RESULTS_DIR, f"config_{site_slug}.json"),
+    }
+
+
+def _default_inference_values(site_name):
+    paths = _training_artifact_paths(site_name)
+    return (
+        _default_param_selection(site_name),
+        paths["model"],
+        paths["scaler"],
+        paths["config"],
+    )
 
 
 def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = True):
@@ -1270,18 +1362,18 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
                 with gr.Column():
                     inference_model_path = gr.Textbox(
                         label="Model .pth path",
-                        value=os.path.join(RESULTS_DIR, "best_model.pth"),
-                        placeholder="/content/water_level_demo/results/best_model.pth",
+                        value=_training_artifact_paths(SITE_CHOICES[0])["model"],
+                        placeholder="/content/water_level_demo/results/training/best_model_<site>.pth",
                     )
                     inference_scaler_path = gr.Textbox(
                         label="Scaler .pkl path",
-                        value=os.path.join(RESULTS_DIR, "scaler.pkl"),
-                        placeholder="/content/water_level_demo/results/scaler.pkl",
+                        value=_training_artifact_paths(SITE_CHOICES[0])["scaler"],
+                        placeholder="/content/water_level_demo/results/training/scaler_<site>.pkl",
                     )
                     inference_config_path = gr.Textbox(
-                        label="Training config.json path",
-                        value=os.path.join(RESULTS_DIR, "config.json"),
-                        placeholder="/content/water_level_demo/results/config.json",
+                        label="Training config file path",
+                        value=_training_artifact_paths(SITE_CHOICES[0])["config"],
+                        placeholder="/content/water_level_demo/results/training/config_<site>.json",
                     )
                     inference_labels_csv_path = gr.Textbox(
                         label="Existing labels CSV path (optional)",
@@ -1291,7 +1383,7 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
                     inference_img_size = gr.Number(
                         value=None,
                         precision=0,
-                        label="Input image size override (blank/0 = config.json)",
+                        label="Input image size override (blank/0 = training config)",
                     )
                     inference_batch_size = gr.Slider(
                         minimum=1,
@@ -1302,9 +1394,14 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
                     )
 
             inference_site_dd.change(
-                fn=_default_param_selection,
+                fn=_default_inference_values,
                 inputs=inference_site_dd,
-                outputs=inference_param_checks,
+                outputs=[
+                    inference_param_checks,
+                    inference_model_path,
+                    inference_scaler_path,
+                    inference_config_path,
+                ],
             )
 
             inference_btn = gr.Button("Run Inference", variant="primary", size="lg")
@@ -1363,11 +1460,15 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
         gr.Markdown(
             """
             ---
-            **Outputs** saved to `water_level_demo/results/`:
-            `best_model.pth` · `scaler.pkl` · `training_history.csv` ·
-            `training_loss_plot.png` · `config.json` · `test_results_<site>.csv` ·
+            **Training outputs** saved to `water_level_demo/results/training/`:
+            `best_model_<site>.pth` · `scaler_<site>.pkl` ·
+            `training_history_<site>.csv` · `training_loss_plot_<site>.png` ·
+            `config_<site>.json` · `test_results_<site>.csv` ·
             `predictions_vs_actuals_<site>.png` · `loss_curves_<site>.png` ·
-            `inference/inference_predictions.csv`
+            `split_summary_<site>.csv`
+            
+            **Inference outputs** saved to `water_level_demo/results/inference/`:
+            `inference_predictions.csv`
             """
         )
 
@@ -1379,6 +1480,7 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
             BASE_DIR,
             DATA_DIR,
             RESULTS_DIR,
+            TRAINING_RESULTS_DIR,
             INFERENCE_OUTPUT_DIR,
         ],
     )

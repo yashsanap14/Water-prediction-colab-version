@@ -75,9 +75,13 @@ The model learns to **look at a camera image and estimate the current water leve
     │   ├── images/       ← downloaded HiVIS JPGs
     │   └── labels.csv    ← image_path + water_level + precipitation
     └── results/
-        ├── best_model.pth
-        ├── scaler.pkl
-        └── training_loss_plot.png
+        ├── training/
+        │   ├── best_model_<site>.pth
+        │   ├── scaler_<site>.pkl
+        │   ├── config_<site>.json
+        │   └── training_loss_plot_<site>.png
+        └── inference/
+            └── inference_predictions.csv
 ```
 
 ---
@@ -213,16 +217,16 @@ Manual setup parameters in the UI:
 ```
 1. Load CSV → detect image_path and water_level columns
 2. Build {image_path: water_level} mapping
-3. StandardScaler fit on training targets → saved as scaler.pkl
+3. StandardScaler fit on training targets → saved as `scaler_<site>.pkl`
 4. Split: train / val / test (stratified by water level)
 5. For each epoch:
    a. Forward pass → EfficientNet backbone → regression head → predicted water level
    b. MSE Loss
    c. Backward pass + Adam optimizer step
    d. Validation loss logged to queue → streamed to Gradio log box
-   e. If val_loss improved → save best_model.pth
+   e. If val_loss improved → save `best_model_<site>.pth`
 6. Evaluate the best checkpoint on the test split
-7. Plot train vs validation loss → training_loss_plot.png and loss_curves_<site>.png
+7. Plot train vs validation loss → `training_loss_plot_<site>.png` and `loss_curves_<site>.png`
 8. Plot predictions vs actuals → predictions_vs_actuals_<site>.png
 9. Save test actuals, predictions, and differences → test_results_<site>.csv
 ```
@@ -368,27 +372,28 @@ y_train_scaled = scaler.fit_transform(y_train.reshape(-1, 1))
 # Model predicts scaled values
 # At inference: scaler.inverse_transform(prediction)
 ```
-Scaler is saved as `scaler.pkl` and must be bundled with `best_model.pth` for deployment.
+Scaler is saved as `scaler_<site>.pkl` and must be bundled with the matching
+`best_model_<site>.pth` and `config_<site>.json` for deployment.
 
 ---
 
 ## Output Files
 
-All saved to `water_level_demo/results/`:
+Training artifacts are saved to `water_level_demo/results/training/`.
+Inference outputs are saved separately to `water_level_demo/results/inference/`.
 
 | File | Description |
 |---|---|
-| `best_model.pth` | PyTorch model weights (best validation loss epoch) |
-| `best_model_<site>.pth` | Site-named copy of the best model weights |
-| `scaler.pkl` | Fitted `StandardScaler` for target inverse-transform |
-| `scaler_<site>.pkl` | Site-named copy of the fitted scaler |
-| `training_loss_plot.png` | Train vs val MSE per epoch |
+| `best_model_<site>.pth` | PyTorch model weights from the best validation loss epoch |
+| `scaler_<site>.pkl` | Fitted `StandardScaler` for target inverse-transform |
+| `config_<site>.json` | Training hyperparameters, ROI, image size, and artifact metadata snapshot |
+| `training_history_<site>.csv` | Per-epoch loss values |
+| `training_loss_plot_<site>.png` | Train vs val MSE per epoch |
 | `loss_curves_<site>.png` | Site-named train vs validation loss plot |
-| `training_history.csv` | Per-epoch loss values |
 | `test_results_<site>.csv` | Test split image paths, actuals, predictions, differences, and absolute errors |
 | `predictions_vs_actuals_<site>.png` | Test split predictions vs actuals plot with RMSE, MAE, and R² |
-| `config.json` | Training hyperparameters snapshot |
-| `split_summary.csv` | Train/val/test split statistics |
+| `split_summary_<site>.csv` | Train/val/test split statistics |
+| `inference_predictions.csv` | Inference predictions CSV under `water_level_demo/results/inference/` |
 
 ---
 
@@ -434,7 +439,8 @@ Opens at: **http://127.0.0.1:7860**
 
 # Cell 2: Launch with public share link
 import os, sys
-os.environ["WATER_LEVEL_DEMO_BASE_DIR"] = os.path.join(os.getcwd(), "water_level_demo")
+default_base_dir = "/content/water_level_demo" if os.path.exists("/content") else os.path.join(os.getcwd(), "water_level_demo")
+os.environ["WATER_LEVEL_DEMO_BASE_DIR"] = os.environ.get("WATER_LEVEL_DEMO_BASE_DIR", default_base_dir)
 sys.path.insert(0, '.')
 import app
 app.launch_gradio(share=True)
@@ -475,7 +481,7 @@ app.launch_gradio(share=True)
 | **NIMS date filtering** | The `site_no` query param on the NIMS cameras endpoint does not filter — all 1,171 cameras are returned and filtered locally. |
 | **15-min matching window** | Images captured more than 15 minutes from a USGS sensor reading will not be matched and are excluded from training. |
 | **Tidal sites** | Coastal sites (Pinewood, Bailey Creek) measure `62620` (tidal elevation), not `00065` (gage height). Selecting the wrong parameter returns no data. |
-| **Inference requires trained artifacts** | The Inference tab needs a compatible `best_model.pth`, `scaler.pkl`, and preferably the training `config.json` so it can reuse the training ROI. |
+| **Inference requires trained artifacts** | The Inference tab needs compatible site-specific artifacts from `results/training/`: `best_model_<site>.pth`, `scaler_<site>.pkl`, and preferably `config_<site>.json` so it can reuse the training ROI. |
 | **NIMS API changes** | The USGS NIMS API is versioned as `v0` and may change. The verified working endpoint as of May 2026 is documented in `data_acquisition.py`. |
 
 ---

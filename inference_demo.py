@@ -50,10 +50,11 @@ else:
     )
 
 DEFAULT_RESULTS_DIR = os.path.join(DEFAULT_BASE_DIR, "results")
+DEFAULT_TRAINING_RESULTS_DIR = os.path.join(DEFAULT_RESULTS_DIR, "training")
 DEFAULT_DATA_DIR = os.path.join(DEFAULT_BASE_DIR, "data")
 DEFAULT_LABELS_CSV_PATH = os.path.join(DEFAULT_DATA_DIR, "labels.csv")
 DEFAULT_INFERENCE_OUTPUT_DIR = os.path.join(DEFAULT_RESULTS_DIR, "inference")
-DEFAULT_ERROR_LOG_PATH = os.path.join(DEFAULT_RESULTS_DIR, "inference_error_log.txt")
+DEFAULT_ERROR_LOG_PATH = os.path.join(DEFAULT_INFERENCE_OUTPUT_DIR, "inference_error_log.txt")
 
 
 def _log_step(log_callback: Optional[Callable[[str], None]], message: str) -> None:
@@ -75,7 +76,7 @@ def save_error_traceback(traceback_text: str, error_log_path: str = DEFAULT_ERRO
 
 
 def load_training_config(config_path: Optional[str]) -> tuple[dict, str, str]:
-    """Read training config.json if available and return (config, path, message)."""
+    """Read the training config file if available and return (config, path, message)."""
     path = os.path.expanduser(str(config_path or "").strip())
     if not path:
         return {}, path, "Training config path is blank."
@@ -136,9 +137,9 @@ def resolve_input_img_size_from_training_config(
     Resolve inference image size.
 
     A positive user-supplied size wins. A value of 0 is treated as blank because
-    Gradio can send an empty Number field as 0. Otherwise use config.json
-    input_img_size. If the config is unavailable or invalid, fall back to
-    fallback_input_img_size.
+    Gradio can send an empty Number field as 0. Otherwise use the training
+    config file's input_img_size. If the config is unavailable or invalid,
+    fall back to fallback_input_img_size.
     """
     if requested_input_img_size not in (None, ""):
         try:
@@ -191,10 +192,7 @@ def _log_model_scaler_pair(
     model_base = os.path.basename(model_path)
     scaler_base = os.path.basename(scaler_path)
     same_dir = os.path.dirname(model_path) == os.path.dirname(scaler_path)
-    generic_pair = model_base == "best_model.pth" and scaler_base == "scaler.pkl"
-    if same_dir and generic_pair:
-        _log_step(log_callback, "Model/scaler pairing: generic training artifacts from the same results directory.")
-    elif same_dir:
+    if same_dir:
         _log_step(log_callback, f"Model/scaler pairing: both artifacts are from the same directory: {os.path.dirname(model_path)}")
     else:
         _log_step(log_callback, "Model/scaler pairing warning: model and scaler are from different directories.")
@@ -594,7 +592,7 @@ def run_inference_from_labels(
             resolved_input_img_size = int(checkpoint_img_size)
             _log_step(
                 log_callback,
-                f"Using input image size from checkpoint because config.json did not provide one: {resolved_input_img_size}.",
+                f"Using input image size from checkpoint because the training config did not provide one: {resolved_input_img_size}.",
             )
 
     _log_step(log_callback, "Preparing dataset")
@@ -898,8 +896,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run water-level inference outside Gradio and print raw errors in Colab."
     )
-    parser.add_argument("--model_path", required=True, help="Path to best_model.pth")
-    parser.add_argument("--scaler_path", required=True, help="Path to scaler.pkl")
+    parser.add_argument("--model_path", required=True, help="Path to site-specific best_model_<site>.pth")
+    parser.add_argument("--scaler_path", required=True, help="Path to site-specific scaler_<site>.pkl")
     parser.add_argument(
         "--labels_csv_path",
         help="Optional labels.csv from acquisition. If set, inference uses CSV image paths and true water levels.",
@@ -915,14 +913,14 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config_path",
         default="",
-        help="Optional training config.json. Used to resolve ROI for labels CSV inference.",
+        help="Optional site-specific training config JSON file. Used to resolve ROI for labels CSV inference.",
     )
     parser.add_argument("--site_name", default=SITE_NAME, help="Site name to store in labels CSV inference output.")
     parser.add_argument(
         "--input_img_size",
         type=int,
         default=None,
-        help="Optional model input image size override. Omit to use config.json when available.",
+        help="Optional model input image size override. Omit to use the training config when available.",
     )
     parser.add_argument("--batch_size", type=int, default=1, help="Inference batch size.")
     parser.add_argument("--output_dir", default=DEFAULT_INFERENCE_OUTPUT_DIR, help="Directory for inference outputs.")

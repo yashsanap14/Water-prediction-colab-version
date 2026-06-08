@@ -166,7 +166,7 @@ def build_image_label_mapping(
     target_col: str,
     image_dir: str,
     roi: Optional[Tuple] = None,
-    max_images: int = 500,
+    max_images: int = 1000,
     seed: int = 42,
 ) -> dict:
     """

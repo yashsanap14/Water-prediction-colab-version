@@ -110,7 +110,7 @@ Water-prediction-colab-version/
 The user selects:
 - **USGS Site** – dropdown of 10 pre-configured sites
 - **Start Date / End Date** – e.g. `2025-01-01` to `2025-03-31`
-- **Max images** – slider 50–500
+- **Max images** – slider 50–1000
 - **USGS Parameters** – checkboxes (gage height, precipitation, etc.)
 - **NIMS API Key** *(optional)*
 
@@ -193,6 +193,8 @@ The Train tab has a **Training Configuration Mode** selector:
 
 - **Best configuration for training** uses the Colab-scaled EfficientNet-B3 defaults: image size 384, batch size 8, fallback batch size 4, learning rate `1e-4`, 12 epochs, and a 70/15/15 train/validation/test split.
 - **Manual setup** shows the hyperparameter controls and uses the values selected by the user.
+- The training image slider supports 50–1000 images and defaults to 200.
+- Training on 1000 images may take longer on a Colab T4. Reduce image size or batch size if GPU memory is limited.
 - Best configuration uses AdamW with `weight_decay=1e-5`, MSE loss, `ReduceLROnPlateau(mode="min", patience=2, factor=0.5)`, and early stopping patience 4.
 - The original MAIN2 EfficientNet-L2 configuration is not used by default in this Gradio app because this version targets Google Colab T4 runs with roughly 500-1000 images.
 - After training finishes, the Train tab displays both result plots: Training vs Validation Loss and Predictions vs Actuals.
@@ -201,7 +203,7 @@ Manual setup parameters in the UI:
 
 | Parameter | Manual Default | Description |
 |---|---|---|
-| Number of images | 200 | How many of the downloaded images to use |
+| Number of images | 200 | How many of the downloaded images to use (50–1000) |
 | Epochs | 5 | Training iterations over the dataset |
 | Batch size | 4 | Images per gradient step |
 | Image size | 384px | Input resolution to the model |
@@ -211,6 +213,18 @@ Manual setup parameters in the UI:
 | Backbone freeze ratio | 0.7 | Fraction of backbone layers frozen (0=all trainable) |
 | Random seed | 42 | For reproducibility |
 | EfficientNet-B3 mode | ✅ | Lighter model recommended for T4 GPU |
+
+Recommended settings for a 1000-image Colab T4 run:
+
+- Number of images: 1000
+- EfficientNet-B3
+- Image size: 384
+- Batch size: 4 or 8, depending on available GPU memory
+- Learning rate: `0.0001`
+- Epochs: 12–15
+- Validation split: 0.15
+- Test split: 0.15
+- Backbone freeze ratio: 0.7
 
 #### Training Loop Detail
 

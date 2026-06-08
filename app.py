@@ -1034,7 +1034,7 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
                             type="string",
                         )
                     max_img_slider = gr.Slider(
-                        minimum=50, maximum=500, value=200, step=10,
+                        minimum=50, maximum=1000, value=200, step=10,
                         label="Max images to download",
                     )
 
@@ -1205,8 +1205,13 @@ def launch_gradio(share: bool = True, debug: bool = True, show_error: bool = Tru
             with gr.Group(visible=False) as manual_training_controls:
                 with gr.Row():
                     with gr.Column():
-                        t_num_images = gr.Slider(50, 500, value=200, step=10,
+                        t_num_images = gr.Slider(50, 1000, value=200, step=10,
                                                 label="Number of images to train on")
+                        gr.Markdown(
+                            "Training on up to 1000 images may take longer on a "
+                            "Colab T4. If GPU memory is limited, reduce the image "
+                            "size or batch size."
+                        )
                         t_epochs     = gr.Slider(1, 20, value=best_cfg["num_epochs"], step=1,
                                                 label="Epochs")
                         t_batch      = gr.Dropdown(choices=[2, 4, 8, 16],
